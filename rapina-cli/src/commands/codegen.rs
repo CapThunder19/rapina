@@ -1,14 +1,10 @@
-use colored::Colorize;
+use crate::commands::schema_type_name;
+
+use super::{Colorize, FieldInfo, NormalizedType};
 use std::fs;
 use std::path::Path;
 
-pub(crate) struct FieldInfo {
-    pub name: String,
-    pub rust_type: String,
-    pub schema_type: String,
-    pub column_method: String,
-    pub nullable: bool,
-}
+pub(crate) use super::relationships::{RelationshipKind, RelationshipSpec};
 
 pub(crate) fn to_pascal_case(s: &str) -> String {
     s.split('_')
@@ -210,7 +206,7 @@ pub(crate) fn generate_handlers(
     plural: &str,
     pascal: &str,
     fields: &[FieldInfo],
-    pk_type: &str,
+    pk_type: &NormalizedType,
 ) -> String {
     let create_fields: Vec<String> = fields
         .iter()
@@ -221,15 +217,22 @@ pub(crate) fn generate_handlers(
     let update_checks: Vec<String> = fields
         .iter()
         .map(|f| {
-            format!(
-                "    if let Some(val) = update.{name} {{\n        active.{name} = Set(val);\n    }}",
-                name = f.name
-            )
+            if f.nullable {
+                 format!(
+                    "    if let Some(val) = update.{name} {{\n        active.{name} = Set(Some(val));\n    }}",
+                    name = f.name
+                )
+            } else {
+                format!(
+                    "    if let Some(val) = update.{name} {{\n        active.{name} = Set(val);\n    }}",
+                    name = f.name
+                )
+            }
         })
         .collect();
     let update_body = update_checks.join("\n");
 
-    let uuid_import = if pk_type.to_lowercase().as_str() == "uuid" {
+    let uuid_import = if pk_type == &NormalizedType::Uuid {
         "use rapina::uuid::Uuid;"
     } else {
         ""
@@ -325,29 +328,35 @@ pub(crate) fn generate_dto(pascal: &str, fields: &[FieldInfo]) -> String {
         .iter()
         .map(|f| {
             if f.nullable {
-                format!("    pub {}: Option<{}>,", f.name, f.rust_type)
+                format!("    pub {}: Option<{}>,", f.name, f.normalized_type)
             } else {
-                format!("    pub {}: {},", f.name, f.rust_type)
+                format!("    pub {}: {},", f.name, f.normalized_type)
             }
         })
         .collect();
 
     let update_fields: Vec<String> = fields
         .iter()
-        .map(|f| format!("    pub {}: Option<{}>,", f.name, f.rust_type))
+        .map(|f| format!("    pub {}: Option<{}>,", f.name, f.normalized_type))
         .collect();
 
     // Build type-specific imports instead of sea_orm glob.
     // Uuid and Decimal must come from their original crates (not sea_orm re-exports)
     // because the sea_orm re-exports don't implement JsonSchema.
-    let needs_uuid = fields.iter().any(|f| f.rust_type == "Uuid");
-    let needs_decimal = fields.iter().any(|f| f.rust_type == "Decimal");
-
-    let sea_orm_types: Vec<&str> = fields
+    let needs_uuid = fields
         .iter()
-        .filter_map(|f| match f.rust_type.as_str() {
-            "DateTimeUtc" | "Date" | "Json" => Some(f.rust_type.as_str()),
-            _ => None,
+        .any(|f| f.normalized_type == NormalizedType::Uuid);
+
+    let needs_decimal = fields
+        .iter()
+        .any(|f| f.normalized_type == NormalizedType::Decimal);
+
+    let sea_orm_types: Vec<String> = fields
+        .iter()
+        .filter_map(|f| {
+            f.normalized_type
+                .sea_orm_import_name()
+                .map(|s| s.to_string())
         })
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -443,11 +452,33 @@ pub(crate) fn generate_schema_block(
     fields: &[FieldInfo],
     timestamps: Option<&str>,
     primary_key: Option<&[String]>,
+    relationships: &[RelationshipSpec],
 ) -> String {
-    let schema_fields: Vec<String> = fields
+    let mut all_field_lines: Vec<String> = fields
         .iter()
-        .map(|f| format!("        {}: {},", f.name, f.schema_type))
+        .map(|f| {
+            format!(
+                "        {}: {},",
+                f.name,
+                schema_type_name(&f.normalized_type, f.nullable)
+            )
+        })
         .collect();
+
+    for r in relationships {
+        let line = match r.kind {
+            RelationshipKind::BelongsTo { nullable: true } => {
+                format!("        {}: Option<{}>,", r.field_name, r.related_pascal)
+            }
+            RelationshipKind::BelongsTo { nullable: false } => {
+                format!("        {}: {},", r.field_name, r.related_pascal)
+            }
+            RelationshipKind::HasMany => {
+                format!("        {}: Vec<{}>,", r.field_name, r.related_pascal)
+            }
+        };
+        all_field_lines.push(line);
+    }
 
     let mut attrs = String::new();
 
@@ -470,7 +501,7 @@ schema! {{
 "#,
         pascal = pascal,
         attrs = attrs,
-        fields = schema_fields.join("\n"),
+        fields = all_field_lines.join("\n"),
     )
 }
 
@@ -478,46 +509,39 @@ pub(crate) fn generate_migration(
     plural: &str,
     pascal_plural: &str,
     fields: &[FieldInfo],
-    pk_type: &str,
+    with_timestamps: bool,
+    primary_key: Option<&[String]>,
 ) -> String {
-    let column_defs: Vec<String> = fields
+    let (mut column_defs, mut iden_variants): (Vec<String>, Vec<String>) = fields
         .iter()
-        .filter(|f| f.name != "id") // Skip id as it's added separately
         .map(|f| {
-            let iden = to_pascal_case(&f.name);
-            format!(
-                "                    .col(ColumnDef::new({pascal_plural}::{iden}){col})",
-                pascal_plural = pascal_plural,
-                iden = iden,
-                col = f.column_method,
+            let mut field = f.clone();
+            if let Some(pk_names) = primary_key {
+                field.is_primary_key = pk_names.contains(&field.name);
+                field.is_composite_pk_member = field.is_primary_key && pk_names.len() > 1;
+            }
+            (
+                format!(
+                    "                    {}",
+                    field.generate_column(pascal_plural)
+                ),
+                format!("    {},", field.ident),
             )
         })
-        .collect();
+        .unzip();
 
-    let iden_variants: Vec<String> = fields
-        .iter()
-        .filter(|f| f.name != "id") // Skip prefix/reserved id
-        .map(|f| format!("    {},", to_pascal_case(&f.name)))
-        .collect();
+    if with_timestamps {
+        column_defs.push(format!(
+            "                    .col(ColumnDef::new({pascal_plural}::CreatedAt).timestamp_with_time_zone().not_null().default(Expr::current_timestamp()))"
+        ));
+        column_defs.push(format!(
+            "                    .col(ColumnDef::new({pascal_plural}::UpdatedAt).timestamp_with_time_zone().not_null().default(Expr::current_timestamp()))"
+        ));
+        iden_variants.push("    CreatedAt,".to_string());
+        iden_variants.push("    UpdatedAt,".to_string());
+    }
 
     let readable_name = format!("create {}", plural);
-
-    let col = match pk_type.to_lowercase().as_str() {
-        "uuid" => format!("ColumnDef::new({pascal_plural}::Id).uuid().not_null().primary_key()"),
-        "i32" | "integer" => {
-            format!(
-                "ColumnDef::new({pascal_plural}::Id).integer().not_null().auto_increment().primary_key()"
-            )
-        }
-        "i64" | "bigint" => {
-            format!(
-                "ColumnDef::new({pascal_plural}::Id).big_integer().not_null().auto_increment().primary_key()"
-            )
-        }
-        _ => format!(
-            r#"ColumnDef::new({pascal_plural}::Id).type_iden(rapina::migration::Alias::new("{pk_type}")).not_null().primary_key()"#
-        ),
-    };
 
     format!(
         r#"//! Migration: {readable_name}
@@ -535,7 +559,6 @@ impl MigrationTrait for Migration {{
             .create_table(
                 Table::create()
                     .table({pascal_plural}::Table)
-                    .col({col})
 {column_defs}
                     .to_owned(),
             )
@@ -552,7 +575,6 @@ impl MigrationTrait for Migration {{
 #[derive(DeriveIden)]
 enum {pascal_plural} {{
     Table,
-    Id,
 {iden_variants}
 }}
 "#,
@@ -611,6 +633,7 @@ pub(crate) fn update_entity_file(
     timestamps: Option<&str>,
     primary_key: Option<&[String]>,
     force: bool,
+    relationships: &[RelationshipSpec],
 ) -> Result<(), String> {
     update_entity_file_in(
         pascal,
@@ -618,6 +641,7 @@ pub(crate) fn update_entity_file(
         timestamps,
         primary_key,
         force,
+        relationships,
         Path::new("src/entity.rs"),
     )
 }
@@ -628,9 +652,11 @@ fn update_entity_file_in(
     timestamps: Option<&str>,
     primary_key: Option<&[String]>,
     force: bool,
+    relationships: &[RelationshipSpec],
     entity_path: &Path,
 ) -> Result<(), String> {
-    let schema_block = generate_schema_block(pascal, fields, timestamps, primary_key);
+    let schema_block =
+        generate_schema_block(pascal, fields, timestamps, primary_key, relationships);
 
     if entity_path.exists() {
         let mut content = fs::read_to_string(entity_path)
@@ -665,7 +691,8 @@ pub(crate) fn create_migration_file(
     plural: &str,
     pascal_plural: &str,
     fields: &[FieldInfo],
-    pk_type: &str,
+    with_timestamps: bool,
+    primary_key: Option<&[String]>,
 ) -> Result<(), String> {
     let migrations_dir = Path::new("src/migrations");
 
@@ -681,7 +708,7 @@ pub(crate) fn create_migration_file(
     let filename = format!("{}.rs", module_name);
     let filepath = migrations_dir.join(&filename);
 
-    let template = generate_migration(plural, pascal_plural, fields, pk_type);
+    let template = generate_migration(plural, pascal_plural, fields, with_timestamps, primary_key);
     fs::write(&filepath, template).map_err(|e| format!("Failed to write migration file: {}", e))?;
     println!(
         "  {} Created {}",
@@ -699,7 +726,7 @@ pub(crate) fn create_feature_module(
     plural: &str,
     pascal: &str,
     fields: &[FieldInfo],
-    pk_type: &str,
+    pk_type: &NormalizedType,
     force: bool,
 ) -> Result<(), String> {
     create_feature_module_in(
@@ -718,7 +745,7 @@ fn create_feature_module_in(
     plural: &str,
     pascal: &str,
     fields: &[FieldInfo],
-    pk_type: &str,
+    pk_type: &NormalizedType,
     force: bool,
     base: &Path,
 ) -> Result<(), String> {
@@ -1188,53 +1215,235 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_schema_block_with_timestamps() {
-        let fields = vec![FieldInfo {
-            name: "title".to_string(),
-            rust_type: "String".to_string(),
-            schema_type: "String".to_string(),
-            column_method: String::new(),
-            nullable: false,
-        }];
+    fn test_generate_handlers() {
+        let fields = vec![
+            "title:string".parse().unwrap(),
+            "active:bool".parse().unwrap(),
+        ];
+        let content = generate_handlers("post", "posts", "Post", &fields, &NormalizedType::I32);
 
-        let block = generate_schema_block("Post", &fields, None, None);
+        assert!(content.contains("pub async fn list_posts"));
+        assert!(content.contains("pub async fn get_post"));
+        assert!(content.contains("pub async fn create_post"));
+        assert!(content.contains("pub async fn update_post"));
+        assert!(content.contains("pub async fn delete_post"));
+        assert!(content.contains("title: Set(input.title),"));
+        assert!(content.contains("active: Set(input.active),"));
+    }
+
+    #[test]
+    fn test_generate_dto() {
+        let fields = vec!["name:string".parse().unwrap(), "age:i32".parse().unwrap()];
+        let content = generate_dto("User", &fields);
+
+        assert!(content.contains("pub struct CreateUser"));
+        assert!(content.contains("pub struct UpdateUser"));
+        assert!(content.contains("pub name: String,"));
+        assert!(content.contains("pub age: i32,"));
+    }
+
+    #[test]
+    fn test_generate_dto_nullable_fields() {
+        let mut fields = vec![
+            "title:string".parse::<FieldInfo>().unwrap(),
+            "bio:string".parse::<FieldInfo>().unwrap(),
+        ];
+        fields[1].nullable = true;
+
+        let content = generate_dto("User", &fields);
+
+        assert!(content.contains("pub title: String,"));
+        assert!(content.contains("pub bio: Option<String>,"));
+    }
+
+    #[test]
+    fn test_generate_dto_uuid_decimal_imports() {
+        let fields = vec!["id:uuid".parse().unwrap(), "price:decimal".parse().unwrap()];
+        let content = generate_dto("Product", &fields);
+
+        assert!(content.contains("use rapina::uuid::Uuid;"));
+        assert!(content.contains("use rapina::rust_decimal::Decimal;"));
+    }
+
+    #[test]
+    fn test_generate_dto_sea_orm_types_import() {
+        let mut fields = vec![
+            "created_at:datetimeutc".parse::<FieldInfo>().unwrap(),
+            "metadata:json".parse::<FieldInfo>().unwrap(),
+        ];
+        fields[1].nullable = true;
+
+        let content = generate_dto("Event", &fields);
+
+        assert!(content.contains("use rapina::sea_orm::prelude::{DateTimeUtc, Json};"));
+    }
+
+    #[test]
+    fn test_generate_schema_block() {
+        let fields = vec![
+            "title:string".parse().unwrap(),
+            "done:bool".parse().unwrap(),
+        ];
+        let content = generate_schema_block("Todo", &fields, None, None, &[]);
+
+        assert!(content.contains("title: String,"));
+        assert!(content.contains("done: bool,"));
+    }
+
+    #[test]
+    fn test_generate_migration() {
+        let fields = vec![
+            "title:string".parse().unwrap(),
+            "published:bool".parse().unwrap(),
+        ];
+        let content = generate_migration("posts", "Posts", &fields, false, None);
+
+        assert!(content.contains(".string().not_null()"));
+        assert!(content.contains(".boolean().default(Expr::value(false)).not_null()"));
+    }
+
+    #[test]
+    fn test_generate_migration_composite_pk() {
+        let fields: Vec<FieldInfo> = vec![
+            "user_id:i32".parse().unwrap(),
+            "role_id:i32".parse().unwrap(),
+        ];
+        let pk = vec!["user_id".to_string(), "role_id".to_string()];
+        let content = generate_migration("user_roles", "UserRoles", &fields, false, Some(&pk));
+
+        // Composite PK columns must NOT have .auto_increment() — invalid SQL on all major DBs
+        assert!(
+            !content.contains(".auto_increment()"),
+            "composite PK columns must NOT have .auto_increment()"
+        );
+        // Both PK columns get .primary_key()
+        let pk_count = content.matches(".primary_key()").count();
+        assert_eq!(
+            pk_count, 2,
+            "both composite PK columns must have .primary_key()"
+        );
+    }
+
+    #[test]
+    fn test_generate_migration_custom_named_pk() {
+        let fields: Vec<FieldInfo> = vec![
+            "uuid_pk:uuid".parse().unwrap(),
+            "title:string".parse().unwrap(),
+        ];
+        let pk = vec!["uuid_pk".to_string()];
+        let content = generate_migration("items", "Items", &fields, false, Some(&pk));
+
+        assert!(
+            content.contains(".uuid().not_null().primary_key()"),
+            "uuid_pk should have .primary_key()"
+        );
+        assert!(
+            !content.contains(".uuid().not_null().primary_key().auto_increment()"),
+            "uuid pk must NOT have .auto_increment()"
+        );
+        assert!(
+            content.contains(".string().not_null()"),
+            "title should be a plain string column"
+        );
+    }
+
+    #[test]
+    fn test_generate_migration_single_i32_custom_named_pk() {
+        // Exercises the composite-vs-single branch in generate_column for an i32 field.
+        // A single-column PK named something other than "id" must still get .auto_increment().
+        let fields: Vec<FieldInfo> = vec![
+            "user_id:i32".parse().unwrap(),
+            "name:string".parse().unwrap(),
+        ];
+        let pk = vec!["user_id".to_string()];
+        let content = generate_migration("users", "Users", &fields, false, Some(&pk));
+
+        assert!(
+            content.contains(".integer().not_null().primary_key().auto_increment()"),
+            "single i32 PK (non-composite) must still emit .auto_increment()"
+        );
+        assert!(
+            content.contains(".string().not_null()"),
+            "name should be a plain string column"
+        );
+    }
+
+    #[test]
+    fn test_generate_migration_default_id_pk_regression() {
+        // When primary_key=None, is_primary_key from FieldInfo (set by heuristic name=="id") is used.
+        let mut fields: Vec<FieldInfo> =
+            vec!["id:i32".parse().unwrap(), "name:string".parse().unwrap()];
+        fields[0].is_primary_key = true;
+        let content = generate_migration("users", "Users", &fields, false, None);
+
+        assert!(
+            content.contains(".integer().not_null().primary_key().auto_increment()"),
+            "id field with is_primary_key=true and None pk list should still emit .primary_key()"
+        );
+        assert!(content.contains(".string().not_null()"));
+    }
+
+    #[test]
+    fn test_generate_schema_block_with_timestamps() {
+        let fields = vec!["title:string".parse().unwrap()];
+
+        let block = generate_schema_block("Post", &fields, None, None, &[]);
         assert!(block.contains("schema! {"));
         assert!(block.contains("Post {"));
         assert!(block.contains("title: String,"));
         assert!(!block.contains("#[timestamps"));
 
-        let block = generate_schema_block("Post", &fields, Some("none"), None);
+        let block = generate_schema_block("Post", &fields, Some("none"), None, &[]);
         assert!(block.contains("#[timestamps(none)]"));
 
-        let block = generate_schema_block("Post", &fields, Some("created_at"), None);
+        let block = generate_schema_block("Post", &fields, Some("created_at"), None, &[]);
         assert!(block.contains("#[timestamps(created_at)]"));
     }
 
     #[test]
     fn test_generate_schema_block_with_primary_key() {
         let fields = vec![
-            FieldInfo {
-                name: "user_id".to_string(),
-                rust_type: "i32".to_string(),
-                schema_type: "i32".to_string(),
-                column_method: ".integer().not_null()".to_string(),
-                nullable: false,
-            },
-            FieldInfo {
-                name: "role_id".to_string(),
-                rust_type: "i32".to_string(),
-                schema_type: "i32".to_string(),
-                column_method: ".integer().not_null()".to_string(),
-                nullable: false,
-            },
+            "user_id:i32".parse().unwrap(),
+            "role_id:i32".parse().unwrap(),
         ];
 
         let pk = vec!["user_id".to_string(), "role_id".to_string()];
-        let block = generate_schema_block("UsersRole", &fields, Some("none"), Some(&pk));
+        let block = generate_schema_block("UsersRole", &fields, Some("none"), Some(&pk), &[]);
         assert!(block.contains("#[primary_key(user_id, role_id)]"));
         assert!(block.contains("#[timestamps(none)]"));
         assert!(block.contains("user_id: i32,"));
         assert!(block.contains("role_id: i32,"));
+    }
+
+    #[test]
+    fn test_generate_schema_block_with_relationships() {
+        let fields = vec!["title:string".parse().unwrap()];
+
+        let rels = vec![
+            RelationshipSpec {
+                field_name: "user".to_string(),
+                related_pascal: "User".to_string(),
+                kind: RelationshipKind::BelongsTo { nullable: false },
+            },
+            RelationshipSpec {
+                field_name: "comments".to_string(),
+                related_pascal: "Comment".to_string(),
+                kind: RelationshipKind::HasMany,
+            },
+        ];
+
+        let block = generate_schema_block("Post", &fields, None, None, &rels);
+        assert!(block.contains("title: String,"));
+        assert!(block.contains("user: User,"));
+        assert!(block.contains("comments: Vec<Comment>,"));
+
+        let nullable_rels = vec![RelationshipSpec {
+            field_name: "author".to_string(),
+            related_pascal: "User".to_string(),
+            kind: RelationshipKind::BelongsTo { nullable: true },
+        }];
+        let block = generate_schema_block("Comment", &fields, None, None, &nullable_rels);
+        assert!(block.contains("author: Option<User>,"));
     }
 
     #[test]
@@ -1280,16 +1489,17 @@ schema! {
         fs::create_dir_all(&module_dir).unwrap();
         fs::write(module_dir.join("mod.rs"), "old content").unwrap();
 
-        let fields = vec![FieldInfo {
-            name: "email".to_string(),
-            rust_type: "String".to_string(),
-            schema_type: "String".to_string(),
-            column_method: String::new(),
-            nullable: false,
-        }];
+        let fields = vec!["email:string".parse().unwrap()];
 
-        let result =
-            create_feature_module_in("user", "users", "User", &fields, "i32", false, dir.path());
+        let result = create_feature_module_in(
+            "user",
+            "users",
+            "User",
+            &fields,
+            &NormalizedType::I32,
+            false,
+            dir.path(),
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already exists"));
     }
@@ -1301,16 +1511,17 @@ schema! {
         fs::create_dir_all(&module_dir).unwrap();
         fs::write(module_dir.join("mod.rs"), "old content").unwrap();
 
-        let fields = vec![FieldInfo {
-            name: "email".to_string(),
-            rust_type: "String".to_string(),
-            schema_type: "String".to_string(),
-            column_method: String::new(),
-            nullable: false,
-        }];
+        let fields = vec!["email:string".parse().unwrap()];
 
-        let result =
-            create_feature_module_in("user", "users", "User", &fields, "i32", true, dir.path());
+        let result = create_feature_module_in(
+            "user",
+            "users",
+            "User",
+            &fields,
+            &NormalizedType::I32,
+            true,
+            dir.path(),
+        );
         assert!(result.is_ok());
         let mod_content = fs::read_to_string(module_dir.join("mod.rs")).unwrap();
         assert!(mod_content.contains("pub mod"));
@@ -1333,15 +1544,9 @@ schema! {
         )
         .unwrap();
 
-        let fields = vec![FieldInfo {
-            name: "title".to_string(),
-            rust_type: "String".to_string(),
-            schema_type: "String".to_string(),
-            column_method: String::new(),
-            nullable: false,
-        }];
+        let fields = vec!["title:string".parse().unwrap()];
 
-        update_entity_file_in("Post", &fields, None, None, true, &entity_path).unwrap();
+        update_entity_file_in("Post", &fields, None, None, true, &[], &entity_path).unwrap();
         let content = fs::read_to_string(&entity_path).unwrap();
         // Should have exactly one schema! block for Post, not two
         assert_eq!(content.matches("Post {").count(), 1);
@@ -1365,15 +1570,9 @@ schema! {
         )
         .unwrap();
 
-        let fields = vec![FieldInfo {
-            name: "title".to_string(),
-            rust_type: "String".to_string(),
-            schema_type: "String".to_string(),
-            column_method: String::new(),
-            nullable: false,
-        }];
+        let fields = vec!["title:string".parse().unwrap()];
 
-        update_entity_file_in("Post", &fields, None, None, false, &entity_path).unwrap();
+        update_entity_file_in("Post", &fields, None, None, false, &[], &entity_path).unwrap();
         let content = fs::read_to_string(&entity_path).unwrap();
         // Without force, should have two schema! blocks (duplicate)
         assert_eq!(content.matches("Post {").count(), 2);

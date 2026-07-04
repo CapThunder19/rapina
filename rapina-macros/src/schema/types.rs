@@ -17,29 +17,50 @@ pub enum ScalarType {
     DateTime,
     NaiveDateTime,
     Date,
+    Time,
     Decimal,
     Json,
+    Bytes,
 }
 
 impl ScalarType {
     /// Parse a type identifier into a scalar type.
+    ///
+    /// Unsigned integer types (`u8`, `u16`, `u32`, `u64`) are intentionally
+    /// rejected here so callers can emit a focused compile-time error.
+    /// Most SQL backends (including Postgres) lack a native unsigned
+    /// integer type, and silently widening to a signed column truncates
+    /// values above the signed maximum. Use [`Self::is_unsupported_unsigned`]
+    /// to detect them in the parser.
     pub fn from_ident(ident: &str) -> Option<Self> {
         match ident {
             "String" => Some(ScalarType::String),
             "Text" => Some(ScalarType::Text),
-            "i32" => Some(ScalarType::I32),
-            "i64" => Some(ScalarType::I64),
-            "f32" => Some(ScalarType::F32),
-            "f64" => Some(ScalarType::F64),
-            "bool" => Some(ScalarType::Bool),
-            "Uuid" => Some(ScalarType::Uuid),
-            "DateTime" => Some(ScalarType::DateTime),
-            "NaiveDateTime" => Some(ScalarType::NaiveDateTime),
-            "Date" => Some(ScalarType::Date),
-            "Decimal" => Some(ScalarType::Decimal),
-            "Json" => Some(ScalarType::Json),
+            "i32" | "i16" | "i8" | "integer" | "int" => Some(ScalarType::I32),
+            "i64" | "bigint" => Some(ScalarType::I64),
+            "f32" | "float" => Some(ScalarType::F32),
+            "f64" | "double" => Some(ScalarType::F64),
+            "bool" | "boolean" => Some(ScalarType::Bool),
+            "Uuid" | "uuid" => Some(ScalarType::Uuid),
+            "DateTime" | "DateTimeUtc" | "timestamptz" => Some(ScalarType::DateTime),
+            "NaiveDateTime" | "timestamp" => Some(ScalarType::NaiveDateTime),
+            "Date" | "date" => Some(ScalarType::Date),
+            "Time" | "time" => Some(ScalarType::Time),
+            "Decimal" | "numeric" | "money" => Some(ScalarType::Decimal),
+            "Json" | "json" | "jsonb" => Some(ScalarType::Json),
+            "Bytes" | "Blob" | "binary" | "bytea" | "varbinary" => Some(ScalarType::Bytes),
             _ => None,
         }
+    }
+
+    /// Returns true for Rust unsigned integer types that would silently
+    /// be coerced to a signed column type if accepted as a scalar.
+    ///
+    /// The parser uses this to surface a clear compile-time error rather
+    /// than generating an `i32`/`i64` field that overflows above the
+    /// signed maximum (issue #549).
+    pub fn is_unsupported_unsigned(ident: &str) -> bool {
+        matches!(ident, "u8" | "u16" | "u32" | "u64")
     }
 
     /// Generate the Rust type for this scalar.
@@ -55,8 +76,10 @@ impl ScalarType {
             ScalarType::DateTime => quote! { DateTimeUtc },
             ScalarType::NaiveDateTime => quote! { DateTime },
             ScalarType::Date => quote! { Date },
+            ScalarType::Time => quote! { Time },
             ScalarType::Decimal => quote! { rapina::rust_decimal::Decimal },
             ScalarType::Json => quote! { Json },
+            ScalarType::Bytes => quote! { Vec<u8> },
         }
     }
 

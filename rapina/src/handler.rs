@@ -7,6 +7,7 @@ use std::sync::Arc;
 use http::Request;
 use hyper::body::Incoming;
 
+use crate::discovery::HeaderParamInfo;
 use crate::error::ErrorVariant;
 use crate::extract::PathParams;
 use crate::response::BoxBody;
@@ -46,6 +47,16 @@ pub trait Handler: Clone + Send + Sync + 'static {
     /// Error variants for OpenAPI documentation.
     fn error_responses() -> Vec<ErrorVariant> {
         Vec::new()
+    }
+
+    /// Typed header parameters declared on this handler.
+    fn header_parameters() -> Vec<HeaderParamInfo> {
+        Vec::new()
+    }
+
+    /// Human-readable description of what this handler does.
+    fn description() -> Option<&'static str> {
+        None
     }
 
     /// Handle the request.

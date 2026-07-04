@@ -1,6 +1,7 @@
 use rapina::database::{Db, DbError};
+use rapina::pagination::{CursorPaginate, CursorPaginated};
 use rapina::prelude::*;
-use rapina::sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+use rapina::sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, PaginatorTrait, Set};
 
 use crate::entity::Todo;
 use crate::entity::todo::{ActiveModel, Model};
@@ -8,11 +9,22 @@ use crate::entity::todo::{ActiveModel, Model};
 use super::dto::{CreateTodo, UpdateTodo};
 use super::error::TodoError;
 
+use crate::AppConfig;
+
 #[get("/todos")]
 #[errors(TodoError)]
 pub async fn list_todos(db: Db) -> Result<Json<Vec<Model>>> {
     let todos = Todo::find().all(db.conn()).await.map_err(DbError)?;
     Ok(Json(todos))
+}
+
+#[get("/todos/cursor")]
+#[errors(TodoError)]
+pub async fn list_todos_cursor(
+    db: Db,
+    cursor: CursorPaginate<i32>,
+) -> Result<CursorPaginated<Model>> {
+    cursor.exec(Todo::find(), db.conn()).await
 }
 
 #[get("/todos/:id")]
@@ -29,7 +41,19 @@ pub async fn get_todo(db: Db, id: Path<i32>) -> Result<Json<Model>> {
 
 #[post("/todos")]
 #[errors(TodoError)]
-pub async fn create_todo(db: Db, body: Json<CreateTodo>) -> Result<Json<Model>> {
+pub async fn create_todo(
+    db: Db,
+    config: State<AppConfig>,
+    body: Validated<Json<CreateTodo>>,
+) -> Result<Json<Model>> {
+    let todo_current_count = Todo::find().count(db.conn()).await.map_err(DbError)?;
+
+    if todo_current_count as u32 >= config.max_todos {
+        return Err(Error::bad_request("Todo limit reached"));
+    };
+
+    let body = body.into_inner();
+
     let todo = ActiveModel {
         title: Set(body.title.clone()),
         ..Default::default()

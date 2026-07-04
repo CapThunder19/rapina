@@ -3,7 +3,6 @@
 //! Extractors are types that implement [`FromRequest`] or [`FromRequestParts`]
 //! and can be used as handler parameters to automatically parse request data.
 
-use bytes::Bytes;
 use http::Request;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
@@ -15,6 +14,12 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
 use validator::Validate;
+
+pub mod header;
+pub use header::{
+    __extract_header, __extract_optional_header, FromHeaderStr, Header, extract_header,
+    extract_optional_header,
+};
 
 #[cfg(feature = "multipart")]
 pub mod multipart;
@@ -132,9 +137,18 @@ pub struct Query<T>(pub T);
 #[derive(Debug)]
 pub struct Form<T>(pub T);
 
-/// Provides access to request headers.
+/// Provides access to all request headers as a raw [`http::HeaderMap`].
 ///
-/// Extracts all HTTP headers from the request.
+/// Extracts the entire header map from the request. Use this when you need to
+/// iterate over all headers or access multiple headers dynamically.
+///
+/// # Distinction from `Header<T>`
+///
+/// - `Headers` — gives you the full [`http::HeaderMap`]; access headers by
+///   name at runtime. No parsing is performed automatically.
+/// - [`Header<T>`](crate::extract::Header) — extracts and parses a single,
+///   named header into a typed value `T` at compile time via the proc-macro.
+///   Prefer `Header<T>` when you know the header name upfront.
 ///
 /// # Examples
 ///
@@ -456,7 +470,7 @@ impl<T: serde::Serialize> IntoResponse for (http::StatusCode, Json<T>) {
         http::Response::builder()
             .status(self.0)
             .header(CONTENT_TYPE, APPLICATION_JSON)
-            .body(http_body_util::Full::new(Bytes::from(body)))
+            .body(crate::response::full(body))
             .unwrap()
     }
 }
@@ -511,8 +525,12 @@ impl<T: DeserializeOwned + Validate + Send> FromRequest for Validated<Json<T>> {
     ) -> Result<Self, Error> {
         let json = Json::<T>::from_request(req, params, state).await?;
         json.0.validate().map_err(|e| {
-            Error::validation("validation failed")
-                .with_details(serde_json::to_value(e).unwrap_or_default())
+            Error::validation("validation failed").with_details(
+                serde_json::to_value(&e).unwrap_or_else(|err| {
+                    tracing::warn!("Failed to serialize validation error details: {err}");
+                    serde_json::Value::default()
+                }),
+            )
         })?;
         Ok(Validated(json))
     }
@@ -526,8 +544,12 @@ impl<T: DeserializeOwned + Validate + Send> FromRequest for Validated<Form<T>> {
     ) -> Result<Self, Error> {
         let form = Form::<T>::from_request(req, params, state).await?;
         form.0.validate().map_err(|e| {
-            Error::validation("validation failed")
-                .with_details(serde_json::to_value(e).unwrap_or_default())
+            Error::validation("validation failed").with_details(
+                serde_json::to_value(&e).unwrap_or_else(|err| {
+                    tracing::warn!("Failed to serialize validation error details: {err}");
+                    serde_json::Value::default()
+                }),
+            )
         })?;
         Ok(Validated(form))
     }
@@ -541,7 +563,7 @@ impl<T: Send + Sync + 'static> FromRequestParts for State<T> {
     ) -> Result<Self, Error> {
         let arc = state.get_arc::<T>().ok_or_else(|| {
             Error::internal(format!(
-                "State not registered for type '{}'. Did you forget to call .state()?",
+                "State not registered for type '{}'. Did you forget to call .state() or .state_arc()?",
                 std::any::type_name::<T>()
             ))
         })?;
@@ -1118,6 +1140,38 @@ mod tests {
         assert_eq!(err.status(), 400);
     }
 
+    #[tokio::test]
+    async fn test_query_extractor_uuid() {
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct Params {
+            id: uuid::Uuid,
+        }
+
+        let id = uuid::Uuid::new_v4();
+        let (parts, _) = TestRequest::get(&format!("/users?id={id}")).into_parts();
+        let result =
+            Query::<Params>::from_request_parts(&parts, &empty_params(), &empty_state()).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0.id, id);
+    }
+
+    #[tokio::test]
+    async fn test_query_extractor_uuid_invalid() {
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize, Debug)]
+        struct Params {
+            id: uuid::Uuid,
+        }
+
+        let (parts, _) = TestRequest::get("/users?id=not-a-uuid").into_parts();
+        let result =
+            Query::<Params>::from_request_parts(&parts, &empty_params(), &empty_state()).await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status(), 400);
+    }
+
     // Headers extractor tests
     #[tokio::test]
     async fn test_headers_extractor() {
@@ -1187,6 +1241,27 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_path_extractor_uuid() {
+        let id = uuid::Uuid::new_v4();
+        let (parts, _) = TestRequest::get(&format!("/users/{id}")).into_parts();
+        let params = params(&[("id", &id.to_string())]);
+
+        let result = Path::<uuid::Uuid>::from_request_parts(&parts, &params, &empty_state()).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0, id);
+    }
+
+    #[tokio::test]
+    async fn test_path_extractor_uuid_invalid() {
+        let (parts, _) = TestRequest::get("/users/not-a-uuid").into_parts();
+        let params = params(&[("id", "not-a-uuid")]);
+
+        let result = Path::<uuid::Uuid>::from_request_parts(&parts, &params, &empty_state()).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status(), 400);
+    }
+
     // Context extractor tests
     #[tokio::test]
     async fn test_context_extractor() {
@@ -1237,6 +1312,35 @@ mod tests {
             State::<MissingState>::from_request_parts(&parts, &empty_params(), &state).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().status(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_state_extractor_arc_trait_object() {
+        trait Greeter: Send + Sync {
+            fn greet(&self) -> &'static str;
+        }
+
+        struct Hello;
+        impl Greeter for Hello {
+            fn greet(&self) -> &'static str {
+                "hello"
+            }
+        }
+
+        let greeter: std::sync::Arc<dyn Greeter> = std::sync::Arc::new(Hello);
+        let state = std::sync::Arc::new(crate::state::AppState::new().with_arc(greeter));
+        let (parts, _) = TestRequest::get("/").into_parts();
+
+        let result = State::<std::sync::Arc<dyn Greeter>>::from_request_parts(
+            &parts,
+            &empty_params(),
+            &state,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // Deref chain: State<Arc<dyn Greeter>> -> Arc<dyn Greeter> -> dyn Greeter
+        assert_eq!(result.unwrap().greet(), "hello");
     }
 
     // into_inner tests
@@ -1626,5 +1730,182 @@ mod tests {
             crate::jobs::Jobs::from_request_parts(&parts, &empty_params(), &empty_state()).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().status(), 500);
+    }
+
+    // Validated<Json<T>> extractor tests
+
+    #[tokio::test]
+    async fn test_validated_json_valid_input() {
+        #[derive(serde::Deserialize, validator::Validate, Debug)]
+        struct Payload {
+            #[validate(length(min = 1))]
+            name: String,
+        }
+
+        let req = TestRequest::post("/")
+            .json(&serde_json::json!({ "name": "Alice" }))
+            .into_incoming_request()
+            .await;
+
+        let result =
+            Validated::<Json<Payload>>::from_request(req, &empty_params(), &empty_state()).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().into_inner().0.name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn test_validated_json_invalid_input_returns_422() {
+        #[derive(serde::Deserialize, validator::Validate, Debug)]
+        struct Payload {
+            #[validate(length(min = 3))]
+            name: String,
+        }
+
+        let req = TestRequest::post("/")
+            .json(&serde_json::json!({ "name": "Al" }))
+            .into_incoming_request()
+            .await;
+
+        let result =
+            Validated::<Json<Payload>>::from_request(req, &empty_params(), &empty_state()).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), 422);
+    }
+
+    #[tokio::test]
+    async fn test_validated_json_invalid_input_details_not_empty() {
+        #[derive(serde::Deserialize, validator::Validate, Debug)]
+        struct Payload {
+            #[validate(email)]
+            email: String,
+        }
+
+        let req = TestRequest::post("/")
+            .json(&serde_json::json!({ "email": "not-an-email" }))
+            .into_incoming_request()
+            .await;
+
+        let result =
+            Validated::<Json<Payload>>::from_request(req, &empty_params(), &empty_state()).await;
+
+        let err = result.unwrap_err();
+        // details should be a non-null object with field errors, not an empty {}
+        let details = err.details();
+        assert!(details.is_some());
+        let details = details.unwrap();
+        assert!(details.is_object());
+        assert!(!details.as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_validated_json_bad_json_returns_400() {
+        let req = TestRequest::post("/")
+            .header("content-type", "application/json")
+            .body(b"{not valid json".as_ref())
+            .into_incoming_request()
+            .await;
+
+        #[derive(serde::Deserialize, validator::Validate, Debug)]
+        #[allow(dead_code)]
+        struct Payload {
+            name: String,
+        }
+
+        let result =
+            Validated::<Json<Payload>>::from_request(req, &empty_params(), &empty_state()).await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status(), 400);
+    }
+
+    // Validated<Form<T>> extractor tests
+
+    #[tokio::test]
+    async fn test_validated_form_valid_input() {
+        #[derive(serde::Deserialize, validator::Validate, Debug)]
+        struct Payload {
+            #[validate(length(min = 1))]
+            name: String,
+        }
+
+        let req = TestRequest::post("/")
+            .form(&serde_json::json!({ "name": "Bob" }))
+            .into_incoming_request()
+            .await;
+
+        let result =
+            Validated::<Form<Payload>>::from_request(req, &empty_params(), &empty_state()).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().into_inner().0.name, "Bob");
+    }
+
+    #[tokio::test]
+    async fn test_validated_form_invalid_input_returns_422() {
+        #[derive(serde::Deserialize, validator::Validate, Debug)]
+        struct Payload {
+            #[validate(length(min = 5))]
+            name: String,
+        }
+
+        let req = TestRequest::post("/")
+            .form(&serde_json::json!({ "name": "Bo" }))
+            .into_incoming_request()
+            .await;
+
+        let result =
+            Validated::<Form<Payload>>::from_request(req, &empty_params(), &empty_state()).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), 422);
+    }
+
+    #[tokio::test]
+    async fn test_validated_form_invalid_input_details_not_empty() {
+        #[derive(serde::Deserialize, validator::Validate, Debug)]
+        struct Payload {
+            #[validate(email)]
+            email: String,
+        }
+
+        let req = TestRequest::post("/")
+            .form(&serde_json::json!({ "email": "bad" }))
+            .into_incoming_request()
+            .await;
+
+        let result =
+            Validated::<Form<Payload>>::from_request(req, &empty_params(), &empty_state()).await;
+
+        let err = result.unwrap_err();
+        let details = err.details();
+        assert!(details.is_some());
+        let details = details.unwrap();
+        assert!(details.is_object());
+        assert!(!details.as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_validated_form_bad_content_type_returns_400() {
+        let req = TestRequest::post("/")
+            .header("content-type", "text/plain")
+            .body(b"name=Bob".as_ref())
+            .into_incoming_request()
+            .await;
+
+        #[derive(serde::Deserialize, validator::Validate, Debug)]
+        #[allow(dead_code)]
+        struct Payload {
+            name: String,
+        }
+
+        let result =
+            Validated::<Form<Payload>>::from_request(req, &empty_params(), &empty_state()).await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status(), 400);
     }
 }
