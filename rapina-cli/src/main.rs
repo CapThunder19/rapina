@@ -6,7 +6,7 @@ mod common;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use terminal_size::{terminal_size, Width};
+use terminal_size::{Width, terminal_size};
 
 use crate::commands::{FieldInfo, templates::DatabaseType};
 
@@ -587,8 +587,15 @@ const JUCA_BANNER: &str = include_str!("../../juca.txt");
 
 fn print_banner() {
     println!();
-    let banner_lines: Vec<&str> = JUCA_BANNER.lines().filter(|line| !line.trim().is_empty()).collect();
-    let banner_width = banner_lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
+    let banner_lines: Vec<&str> = JUCA_BANNER
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let banner_width = banner_lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
     let terminal_width = terminal_size()
         .map(|(Width(width), _)| usize::from(width))
         .or_else(|| {
