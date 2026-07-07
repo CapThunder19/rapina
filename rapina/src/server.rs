@@ -12,7 +12,6 @@ use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 
-use crate::context::RequestContext;
 use crate::date_cache::DateHeaderCache;
 use crate::middleware::MiddlewareStack;
 use crate::router::Router;
@@ -77,11 +76,10 @@ pub(crate) async fn serve(
                     let middlewares = middlewares.clone();
                     let date_cache = date_cache.clone();
 
-                    let ctx = RequestContext::new();
-                    req.extensions_mut().insert(ctx.clone());
+                    let ctx = router.prepare_request(&mut req);
 
                     async move {
-                        let mut response = middlewares.execute(req, &router, &state, &ctx).await;
+                        let mut response = middlewares.execute(req, router, state, &ctx).await;
                         response
                             .headers_mut()
                             .insert(http::header::DATE, date_cache.header_value());

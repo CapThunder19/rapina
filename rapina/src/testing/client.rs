@@ -16,7 +16,6 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use crate::context::RequestContext;
 use crate::middleware::MiddlewareStack;
 use crate::response::{APPLICATION_JSON, FORM_CONTENT_TYPE};
 use crate::router::Router;
@@ -91,11 +90,10 @@ impl TestClient {
                                         let state = state.clone();
                                         let middlewares = middlewares.clone();
 
-                                        let ctx = RequestContext::new();
-                                        req.extensions_mut().insert(ctx.clone());
+                                        let ctx = router.prepare_request(&mut req);
 
                                         async move {
-                                            let response = middlewares.execute(req, &router, &state, &ctx).await;
+                                            let response = middlewares.execute(req, router, state, &ctx).await;
                                             Ok::<_, std::convert::Infallible>(response)
                                         }
                                     });
@@ -391,8 +389,8 @@ mod tests {
                     http::Response::builder()
                         .status(StatusCode::OK)
                         .header(http::header::CONTENT_TYPE, APPLICATION_JSON)
-                        .body(http_body_util::Full::new(bytes::Bytes::from(
-                            r#"{"id":1,"name":"test"}"#,
+                        .body(crate::response::full(bytes::Bytes::from_static(
+                            br#"{"id":1,"name":"test"}"#,
                         )))
                         .unwrap()
                 }),

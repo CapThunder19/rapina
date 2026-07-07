@@ -1,9 +1,9 @@
 //! Health checks for your Rapina API.
 
+use crate::commands::agents::{DriftStatus, check_drift, fix_agents, simple_diff};
 use crate::common::urls;
 use colored::Colorize;
 use serde_json::Value;
-use std::process::Command;
 
 struct DiagnosticResult {
     warnings: Vec<String>,
@@ -14,11 +14,18 @@ struct DiagnosticResult {
 pub struct DoctorConfig {
     pub host: String,
     pub port: u16,
+    pub fix_agents: bool,
+    pub force: bool,
 }
 
 /// Run health checks on the API.
 pub fn execute(config: DoctorConfig) -> Result<(), String> {
     println!();
+
+    // ── Local checks (no server required) ────────────────────────────────────
+    check_agents_drift(&config)?;
+
+    // ── Server checks ─────────────────────────────────────────────────────────
     println!(
         "  {} Running API health checks on http://{}:{}...",
         "→".cyan(),
@@ -40,6 +47,7 @@ pub fn execute(config: DoctorConfig) -> Result<(), String> {
     check_error_documentation(&routes, &mut result);
     check_openapi_metadata(&openapi, &mut result);
     check_duplicate_routes(&routes, &mut result);
+    check_llms_txt(&config.host, config.port, &mut result);
 
     print_results(&result);
 
@@ -48,6 +56,100 @@ pub fn execute(config: DoctorConfig) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn check_agents_drift(config: &DoctorConfig) -> Result<(), String> {
+    match check_drift(std::path::Path::new(".")) {
+        DriftStatus::UpToDate => {
+            println!("  {} AGENTS.md is up to date", "✓".green());
+        }
+        DriftStatus::Missing => {
+            if config.fix_agents {
+                fix_agents(std::path::Path::new("."), config.force)?;
+                println!("  {} Created AGENTS.md", "✓".green());
+            } else {
+                println!(
+                    "  {} AGENTS.md not found — run {} to generate it",
+                    "⚠".yellow(),
+                    "rapina doctor --fix-agents".cyan()
+                );
+            }
+        }
+        DriftStatus::NoBlock => {
+            if config.fix_agents {
+                fix_agents(std::path::Path::new("."), config.force)?;
+                println!(
+                    "  {} Injected rapina-agent-rules block into AGENTS.md",
+                    "✓".green()
+                );
+            } else {
+                println!(
+                    "  {} AGENTS.md has no rapina-agent-rules block — run {} to add one",
+                    "⚠".yellow(),
+                    "rapina doctor --fix-agents".cyan()
+                );
+            }
+        }
+        DriftStatus::Stale { stored_version } => {
+            if config.fix_agents {
+                fix_agents(std::path::Path::new("."), config.force)?;
+                println!("  {} AGENTS.md refreshed", "✓".green());
+            } else {
+                println!(
+                    "  {} AGENTS.md is stale (was v{stored_version}, now v{}) — run {} to refresh",
+                    "⚠".yellow(),
+                    env!("CARGO_PKG_VERSION"),
+                    "rapina doctor --fix-agents".cyan()
+                );
+            }
+        }
+        DriftStatus::UserEdited {
+            on_disk_body,
+            current_body,
+        } => {
+            if config.fix_agents && config.force {
+                fix_agents(std::path::Path::new("."), true)?;
+                println!("  {} AGENTS.md overwritten (--force)", "✓".green());
+            } else {
+                println!(
+                    "  {} AGENTS.md has been edited inside the {}...{} markers",
+                    "✗".red(),
+                    "<!-- BEGIN:rapina-agent-rules".cyan(),
+                    "-->".cyan()
+                );
+                println!();
+                println!("  Move your custom rules outside the markers, then run:");
+                println!("    {}", "rapina doctor --fix-agents".cyan());
+                println!();
+                println!(
+                    "  To overwrite your edits: {}",
+                    "rapina doctor --fix-agents --force".cyan()
+                );
+                println!();
+                println!(
+                    "  Diff (on-disk vs current bundled fragments; grouped: removals first, then additions):"
+                );
+                for line in simple_diff(&on_disk_body, &current_body).lines() {
+                    if line.starts_with('-') {
+                        println!("    {}", line.red());
+                    } else if line.starts_with('+') {
+                        println!("    {}", line.green());
+                    } else {
+                        println!("    {}", line);
+                    }
+                }
+                println!();
+                return Err("AGENTS.md has user edits inside the markers".to_string());
+            }
+        }
+        DriftStatus::NotInProject => {
+            println!(
+                "  {} Not in a Rapina project — skipping AGENTS.md check",
+                "⚠".yellow()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Check that routes have response schemas.
@@ -216,6 +318,37 @@ fn check_openapi_metadata(openapi: &Result<Value, String>, result: &mut Diagnost
     }
 }
 
+/// Check that /__rapina/llms.txt is reachable and not returning 404.
+fn check_llms_txt(host: &str, port: u16, result: &mut DiagnosticResult) {
+    let url = urls::build_llms_url(host, port);
+    match crate::common::AGENT.get(&url).call() {
+        Ok(_) => {
+            result
+                .passed
+                .push("llms.txt is enabled and reachable".to_string());
+        }
+        Err(ureq::Error::StatusCode(404)) => {
+            result.warnings.push(
+                "llms.txt endpoint returns 404 — disabled in release builds by default. \
+                Call enable_llms_txt() on your App to turn it on."
+                    .to_string(),
+            );
+        }
+        Err(ureq::Error::StatusCode(status)) => {
+            result.warnings.push(format!(
+                "llms.txt endpoint returned unexpected status {status} — expected 200"
+            ));
+        }
+        Err(_) => {
+            result.warnings.push(
+                "llms.txt endpoint is unreachable — disabled in release builds by default. \
+                Call enable_llms_txt() on your App to turn it on."
+                    .to_string(),
+            );
+        }
+    }
+}
+
 /// Print diagnostic results.
 fn print_results(result: &DiagnosticResult) {
     // Print passed checks
@@ -255,20 +388,16 @@ fn print_results(result: &DiagnosticResult) {
 
 /// Fetch JSON from URL.
 fn fetch_json(url: &str) -> Result<Value, String> {
-    let output = Command::new("curl")
-        .args(["-s", "-f", url])
-        .output()
-        .map_err(|e| format!("Failed to run curl: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "Failed to fetch data. Is the server running? ({})",
-            url
-        ));
-    }
-
-    let body =
-        String::from_utf8(output.stdout).map_err(|e| format!("Invalid UTF-8 response: {}", e))?;
+    let mut response = crate::common::AGENT.get(url).call().map_err(|e| {
+        format!(
+            "Failed to fetch data. Is the server running? ({}) ({})",
+            url, e
+        )
+    })?;
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("Failed to read response body: {}", e))?;
 
     serde_json::from_str(&body).map_err(|e| format!("Invalid JSON response: {}", e))
 }
@@ -502,5 +631,96 @@ mod tests {
         check_openapi_metadata(&openapi, &mut result);
         assert!(result.warnings.is_empty());
         assert_eq!(result.passed.len(), 1);
+    }
+
+    #[test]
+    fn test_fetch_json_success() {
+        let json = r#"{"status":"ok"}"#;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 4096];
+            use std::io::Read;
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            use std::io::Write;
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let result = fetch_json(&format!("http://127.0.0.1:{}", port));
+        handle.join().unwrap();
+        assert_eq!(result.unwrap(), serde_json::json!({"status": "ok"}));
+    }
+
+    #[test]
+    fn test_fetch_json_connection_refused() {
+        let result = fetch_json("http://127.0.0.1:1");
+        assert!(result.is_err());
+    }
+
+    fn serve_once(status: u16, body: &'static str) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 4096];
+            use std::io::Read;
+            let _ = stream.read(&mut buf);
+            let status_text = if status == 200 { "OK" } else { "Not Found" };
+            let response = format!(
+                "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            use std::io::Write;
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        port
+    }
+
+    #[test]
+    fn check_llms_txt_passes_when_200() {
+        let port = serve_once(200, "# LLMs\n");
+        let mut result = DiagnosticResult {
+            warnings: Vec::new(),
+            errors: Vec::new(),
+            passed: Vec::new(),
+        };
+        check_llms_txt("127.0.0.1", port, &mut result);
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.passed.len(), 1);
+        assert!(result.passed[0].contains("llms.txt"));
+    }
+
+    #[test]
+    fn check_llms_txt_warns_when_404() {
+        let port = serve_once(404, "");
+        let mut result = DiagnosticResult {
+            warnings: Vec::new(),
+            errors: Vec::new(),
+            passed: Vec::new(),
+        };
+        check_llms_txt("127.0.0.1", port, &mut result);
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("404"));
+        assert!(result.warnings[0].contains("enable_llms_txt()"));
+        assert!(result.passed.is_empty());
+    }
+
+    #[test]
+    fn check_llms_txt_warns_when_unreachable() {
+        let mut result = DiagnosticResult {
+            warnings: Vec::new(),
+            errors: Vec::new(),
+            passed: Vec::new(),
+        };
+        check_llms_txt("127.0.0.1", 1, &mut result);
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("unreachable"));
+        assert!(result.warnings[0].contains("enable_llms_txt()"));
+        assert!(result.passed.is_empty());
     }
 }

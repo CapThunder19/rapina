@@ -13,7 +13,7 @@ Add the database feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rapina = { version = "0.11.0", features = ["postgres"] }
+rapina = { version = "0.13.0", features = ["postgres"] }
 # or "mysql", "sqlite"
 ```
 
@@ -40,6 +40,8 @@ Set your database URL via environment variable:
 ```bash
 DATABASE_URL=postgres://user:password@localhost:5432/myapp
 ```
+
+Optional: set `DATABASE_AUTO_MIGRATE=true` if you use `.run_migrations()` and want pending migrations applied on every startup (defaults to `false`; see [Migrations](/docs/core-concepts/migrations/)).
 
 ## The Db Extractor
 

@@ -1,11 +1,19 @@
 use std::fs;
 use std::path::Path;
 
-use super::{generate_cargo_toml, generate_gitignore, write_file};
+use super::{
+    DatabaseType, generate_cargo_toml, generate_env_content, generate_gitignore,
+    generate_gitignore_extras, generate_rapina_dep, write_file, write_migrate_bin,
+};
 
-pub fn generate(name: &str, project_path: &Path, src_path: &Path) -> Result<(), String> {
+pub fn generate(
+    name: &str,
+    project_path: &Path,
+    src_path: &Path,
+    db_type: &DatabaseType,
+) -> Result<(), String> {
     let version = env!("CARGO_PKG_VERSION");
-    let rapina_dep = format!("{{ version = \"{version}\", features = [\"sqlite\"] }}");
+    let rapina_dep = generate_rapina_dep(version, Some(db_type));
 
     write_file(
         &project_path.join("Cargo.toml"),
@@ -24,7 +32,7 @@ pub fn generate(name: &str, project_path: &Path, src_path: &Path) -> Result<(), 
     )?;
     write_file(
         &project_path.join(".gitignore"),
-        &generate_gitignore(&["*.db"]),
+        &generate_gitignore(&generate_gitignore_extras(Some(db_type))),
         ".gitignore",
     )?;
 
@@ -42,6 +50,15 @@ pub fn generate(name: &str, project_path: &Path, src_path: &Path) -> Result<(), 
         "src/migrations/m20240101_000001_create_items.rs",
     )?;
 
+    // Generate .env file
+    write_file(
+        &project_path.join(".env"),
+        &generate_env_content(Some(db_type), None),
+        ".env",
+    )?;
+
+    write_migrate_bin(src_path)?;
+
     Ok(())
 }
 
@@ -55,12 +72,20 @@ use rapina::middleware::RequestLogMiddleware;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    load_dotenv();
+
+    let db_config = DatabaseConfig::from_env()
+        .expect("Failed to configure database")
+        .auto_migrate(true);
+
     Rapina::new()
         .with_tracing(TracingConfig::new())
         .middleware(RequestLogMiddleware::new())
         .with_health_check(true)
-        .with_database(DatabaseConfig::new("sqlite://app.db?mode=rwc"))
+        .with_database(db_config)
         .await?
+        // NOTE: With auto_migrate(true), run_migrations applies pending migrations on every startup.
+        // Default is auto_migrate(false); use `rapina migrate up` for controlled / multi-replica deploys.
         .run_migrations::<migrations::Migrator>()
         .await?
         .router(
@@ -205,8 +230,11 @@ mod tests {
     #[test]
     fn test_generate_main_rs_uses_database_config() {
         let content = generate_main_rs();
-        assert!(content.contains("DatabaseConfig::new("));
-        assert!(content.contains(".with_database("));
+        assert!(content.contains("load_dotenv()"));
+        assert!(content.contains("let db_config ="));
+        assert!(content.contains(".auto_migrate(true)"));
+        assert!(content.contains(".with_database(db_config)"));
+        assert!(content.contains(".await?"));
         assert!(content.contains(".run_migrations::<migrations::Migrator>()"));
         assert!(!content.contains("rapina::database::connect"));
     }
@@ -219,6 +247,12 @@ mod tests {
         assert!(content.contains(".post(\"/items\", items::create)"));
         assert!(content.contains(".put(\"/items/:id\", items::update)"));
         assert!(content.contains(".delete(\"/items/:id\", items::delete)"));
+    }
+
+    #[test]
+    fn test_generate_main_rs_postgres_uses_from_env() {
+        let content = generate_main_rs();
+        assert!(content.contains("DatabaseConfig::from_env()"));
     }
 
     #[test]
@@ -255,10 +289,40 @@ mod tests {
     }
 
     #[test]
-    fn test_gitignore_includes_db_files() {
+    fn test_gitignore_includes_db_files_for_sqlite() {
         let content = generate_gitignore(&["*.db"]);
         assert!(content.contains("/target"));
         assert!(content.contains("Cargo.lock"));
         assert!(content.contains("*.db"));
+    }
+
+    #[test]
+    fn test_generate_env_file_sqlite() {
+        let content = generate_env_content(Some(&DatabaseType::Sqlite), None);
+        assert!(content.contains("DATABASE_URL=sqlite://"));
+        assert!(content.contains("Replace"));
+    }
+
+    #[test]
+    fn test_generate_env_file_postgres() {
+        let content = generate_env_content(Some(&DatabaseType::Postgres), None);
+        assert!(content.contains("DATABASE_URL=postgres://"));
+        assert!(content.contains("Replace"));
+    }
+
+    #[test]
+    fn test_generate_env_file_mysql() {
+        let content = generate_env_content(Some(&DatabaseType::Mysql), None);
+        assert!(content.contains("DATABASE_URL=mysql://"));
+        assert!(content.contains("Replace"));
+    }
+
+    #[test]
+    fn test_crud_generate_creates_migrate_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        generate("myapp", dir.path(), &src, &DatabaseType::Sqlite).unwrap();
+        assert!(src.join("bin").join("rapina_migrate.rs").exists());
     }
 }

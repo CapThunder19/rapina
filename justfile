@@ -39,17 +39,23 @@ release VERSION:
     # Bump rapina-macros cross-reference in rapina/Cargo.toml
     sed -i '' 's/rapina-macros = { version = "[^"]*"/rapina-macros = { version = "{{VERSION}}"/' rapina/Cargo.toml
 
-    # Bump version references in docs and examples
-    find docs/ rapina/examples/ \( -name "*.md" -o -name "*.toml" \) \
-        | xargs sed -i '' "s/rapina = { version = \"[0-9][^\"]*\"/rapina = { version = \"{{VERSION}}\"/g"
+    # Bump version references in docs and examples (excluding blog history)
+    find docs/content/docs/ rapina/examples/ \( -name "*.md" -o -name "*.toml" \) \
+        | xargs sed -i '' \
+            -e "s/rapina = { version = \"[0-9][^\"]*\"/rapina = { version = \"{{VERSION}}\"/g" \
+            -e "s/^rapina = \"[0-9][^\"]*\"/rapina = \"{{VERSION}}\"/g"
 
     # Regenerate Cargo.lock
     cargo check --workspace
 
+    # Refresh snapshots that embed the crate version (e.g. llms.txt footer)
+    INSTA_UPDATE=always cargo test --locked -p rapina --lib introspection::llms
+
     # Create branch, commit, push, open PR
     git checkout -b release_{{VERSION}}
-    git add rapina/Cargo.toml rapina-macros/Cargo.toml rapina-cli/Cargo.toml Cargo.lock
+    git add rapina/Cargo.toml rapina-macros/Cargo.toml rapina-cli/Cargo.toml Cargo.lock CHANGELOG.md
     git add docs/ rapina/examples/
+    git add rapina/src/introspection/snapshots/
     git commit -m "Bump version to {{VERSION}}"
     git push origin release_{{VERSION}}
     gh pr create \

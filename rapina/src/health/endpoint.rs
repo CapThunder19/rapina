@@ -16,10 +16,9 @@ use hyper::body::Incoming;
 use crate::{
     extract::PathParams,
     health::config::HealthRegistry,
-    response::{APPLICATION_JSON, BoxBody},
+    response::{APPLICATION_JSON, BoxBody, full},
     state::AppState,
 };
-
 /// Handler for `GET /__rapina/health/live`.
 ///
 /// Always returns `200 OK` with `{"status": "ok"}` as long as the process is running.
@@ -36,9 +35,7 @@ pub async fn liveness_check(
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, APPLICATION_JSON)
-        .body(http_body_util::Full::new(bytes::Bytes::from(
-            serde_json::to_vec(&body).unwrap_or_default(),
-        )))
+        .body(full(serde_json::to_vec(&body).unwrap_or_default()))
         .unwrap()
 }
 
@@ -80,6 +77,22 @@ pub async fn readiness_check(
         }
     }
 
+    // JWT configuration check — surfaces validate_aud misconfiguration before real traffic hits.
+    #[cfg(feature = "jwks")]
+    {
+        use jsonwebtoken::Validation;
+        if let Some(validation) = state.get::<Validation>() {
+            let jwt_ok = !(validation.validate_aud && validation.aud.is_none());
+            checks.insert(
+                "jwt".to_string(),
+                if jwt_ok { "ok".into() } else { "error".into() },
+            );
+            if !jwt_ok {
+                all_ok = false;
+            }
+        }
+    }
+
     // Custom checks registered via `.add_health_check(name, fn)` on the builder.
     // Each check is called sequentially; all results are collected before responding.
     if let Some(registry) = state.get::<HealthRegistry>() {
@@ -109,9 +122,7 @@ pub async fn readiness_check(
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, APPLICATION_JSON)
-        .body(http_body_util::Full::new(bytes::Bytes::from(
-            serde_json::to_vec(&body).unwrap_or_default(),
-        )))
+        .body(full(serde_json::to_vec(&body).unwrap_or_default()))
         .unwrap()
 }
 
@@ -235,6 +246,42 @@ mod tests {
         assert_eq!(json["status"], "error");
         assert_eq!(json["checks"]["redis"], "ok");
         assert_eq!(json["checks"]["stripe"], "error");
+    }
+
+    #[cfg(feature = "jwks")]
+    #[tokio::test]
+    async fn test_readiness_check_jwt_misconfiguration_returns_503() {
+        use crate::jwt::default_validation;
+
+        let misconfigured = default_validation(); // validate_aud=true, aud=None
+        let app = Rapina::new().with_health_check(true).state(misconfigured);
+        let client = TestClient::new(app).await;
+        let response = client.get("/__rapina/health/ready").send().await;
+        let status = response.status();
+        let json = response.json::<Value>();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["checks"]["jwt"], "error");
+    }
+
+    #[cfg(feature = "jwks")]
+    #[tokio::test]
+    async fn test_readiness_check_jwt_correctly_configured_returns_ok() {
+        use crate::jwt::default_validation;
+
+        let mut validation = default_validation();
+        validation.set_audience(&["https://example.com/api"]);
+        let app = Rapina::new().with_health_check(true).state(validation);
+        let client = TestClient::new(app).await;
+        let json = client
+            .get("/__rapina/health/ready")
+            .send()
+            .await
+            .json::<Value>();
+
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["checks"]["jwt"], "ok");
     }
 
     #[cfg(feature = "sqlite")]

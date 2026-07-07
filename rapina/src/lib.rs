@@ -57,6 +57,7 @@
 //! - [`Context`](extract::Context) - Access request context with trace_id
 //! - [`Validated`](extract::Validated) - Validate extracted data
 //! - [`Multipart`](extract::Multipart) - Parse multipart form data (e.g. file uploads)
+//! - [`JsonWebToken`](jwt::JsonWebToken) - Parse and validate Json Web Tokens with configurable JWKS
 
 //!
 //! ## Middleware
@@ -88,17 +89,23 @@ pub mod cache;
 pub mod cache_redis;
 pub mod config;
 pub mod context;
+#[cfg(feature = "cron-scheduler")]
+pub(crate) mod cron_scheduler;
 #[cfg(feature = "database")]
 pub mod database;
 pub(crate) mod date_cache;
 pub mod discovery;
 pub mod error;
 pub mod extract;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 pub mod handler;
 pub mod health;
 pub mod introspection;
 #[cfg(feature = "database")]
 pub mod jobs;
+#[cfg(feature = "jwks")]
+pub mod jwt;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod middleware;
@@ -136,22 +143,35 @@ pub mod prelude {
     };
     pub use crate::context::RequestContext;
     pub use crate::error::{DocumentedError, Error, ErrorVariant, IntoApiError, Result};
-    pub use crate::extract::{Context, Cookie, Form, Headers, Json, Path, Query, State, Validated};
+    pub use crate::extract::{
+        Context, Cookie, Form, Header, Headers, Json, Path, Query, State, Validated,
+    };
     #[cfg(feature = "multipart")]
     pub use crate::extract::{Field, Multipart};
     pub use crate::introspection::RouteInfo;
     #[cfg(feature = "database")]
     pub use crate::jobs::{JobDescriptor, JobId, JobRequest, JobResult, JobRow, JobStatus, Jobs};
+    #[cfg(feature = "jwks")]
+    pub use crate::jwt::{JsonWebToken, JwksClient};
     #[cfg(feature = "rate-limit")]
     pub use crate::middleware::{KeyExtractor, RateLimitConfig};
     pub use crate::middleware::{Middleware, Next, RequestLogConfig};
+    #[cfg(feature = "tower")]
+    pub use crate::middleware::{RapinaService, TowerLayerMiddleware};
+    #[cfg(feature = "otel")]
+    pub use crate::observability::TelemetryConfig;
     pub use crate::observability::TracingConfig;
     #[cfg(feature = "database")]
-    pub use crate::pagination::{Paginate, Paginated, PaginationConfig};
+    pub use crate::pagination::{
+        CursorKey, CursorPaginate, CursorPaginated, Paginate, Paginated, PaginationConfig,
+    };
     #[cfg(feature = "websocket")]
     pub use crate::relay::{Relay, RelayConfig, RelayEvent};
     pub use crate::response::{IntoResponse, StaticStr};
     pub use crate::router::Router;
+
+    #[cfg(feature = "graphql")]
+    pub use crate::graphql::{GraphQLRequest, GraphQLResponse};
 
     pub use http::{Method, StatusCode};
     pub use schemars::JsonSchema;
@@ -168,10 +188,13 @@ pub use rapina_macros::{Config, delete, get, job, patch, post, public, put, rela
 // Re-export dependencies so users don't need to add them to their Cargo.toml
 pub use http;
 pub use hyper;
+#[cfg(feature = "metrics")]
+pub use prometheus;
 pub use rust_decimal;
 pub use schemars;
 pub use serde_json;
 pub use uuid;
+pub use validator;
 
 #[doc(hidden)]
 pub use inventory;

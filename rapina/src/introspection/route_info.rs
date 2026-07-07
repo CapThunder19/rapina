@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 
+use crate::discovery::HeaderParamInfo;
 use crate::error::ErrorVariant;
 
 /// Metadata about a registered route.
@@ -14,7 +15,7 @@ use crate::error::ErrorVariant;
 /// ```
 /// use rapina::introspection::RouteInfo;
 ///
-/// let info = RouteInfo::new("GET", "/users/:id", "get_user", None, None, None::<String>, None, Vec::new());
+/// let info = RouteInfo::new("GET", "/users/:id", "get_user", None, None, None::<String>, None, Vec::new(), Vec::new(), None::<String>);
 /// assert_eq!(info.method, "GET");
 /// assert_eq!(info.path, "/users/:id");
 /// ```
@@ -41,9 +42,22 @@ pub struct RouteInfo {
     /// Error variants for OpenAPI documentation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub error_responses: Vec<ErrorVariant>,
+    /// Typed header parameters declared on this handler.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub header_parameters: Vec<HeaderParamInfo>,
+    /// Human-readable description of what this handler does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 impl RouteInfo {
+    /// Returns `true` if this route is an internal Rapina route (i.e. served
+    /// under the `/__rapina/` prefix and not part of the user-defined API
+    /// surface).
+    pub fn is_internal(&self) -> bool {
+        self.path.starts_with("/__rapina")
+    }
+
     /// Creates a new RouteInfo with the given metadata.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -55,6 +69,8 @@ impl RouteInfo {
         request_content_type: Option<impl Into<String>>,
         request_body_required: Option<bool>,
         error_responses: Vec<ErrorVariant>,
+        header_parameters: Vec<HeaderParamInfo>,
+        description: Option<impl Into<String>>,
     ) -> Self {
         Self {
             method: method.into(),
@@ -65,6 +81,8 @@ impl RouteInfo {
             request_content_type: request_content_type.map(|s| s.into()),
             request_body_required,
             error_responses,
+            header_parameters,
+            description: description.map(|s| s.into()),
         }
     }
 }
@@ -84,6 +102,8 @@ mod tests {
             None::<String>,
             None,
             Vec::new(),
+            Vec::new(),
+            None::<String>,
         );
         assert_eq!(info.method, "GET");
         assert_eq!(info.path, "/users");
@@ -101,6 +121,8 @@ mod tests {
             None::<String>,
             None,
             Vec::new(),
+            Vec::new(),
+            None::<String>,
         );
         assert_eq!(info.path, "/users/:id");
     }
@@ -116,6 +138,8 @@ mod tests {
             None::<String>,
             None,
             Vec::new(),
+            Vec::new(),
+            None::<String>,
         );
         let cloned = info.clone();
         assert_eq!(info, cloned);
@@ -132,6 +156,8 @@ mod tests {
             None::<String>,
             None,
             Vec::new(),
+            Vec::new(),
+            None::<String>,
         );
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"method\":\"GET\""));
@@ -150,6 +176,8 @@ mod tests {
             None::<String>,
             None,
             Vec::new(),
+            Vec::new(),
+            None::<String>,
         );
         let debug = format!("{:?}", info);
         assert!(debug.contains("DELETE"));
@@ -172,8 +200,80 @@ mod tests {
             None::<String>,
             None,
             errors,
+            Vec::new(),
+            None::<String>,
         );
         assert_eq!(info.error_responses.len(), 1);
         assert_eq!(info.error_responses[0].status, 404);
+    }
+
+    #[test]
+    fn test_route_info_with_description() {
+        let info = RouteInfo::new(
+            "GET",
+            "/users",
+            "list_users",
+            None,
+            None,
+            None::<String>,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some("List all users"),
+        );
+        assert_eq!(info.description, Some("List all users".to_string()));
+    }
+
+    #[test]
+    fn test_route_info_description_none_by_default() {
+        let info = RouteInfo::new(
+            "GET",
+            "/users",
+            "list_users",
+            None,
+            None,
+            None::<String>,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None::<String>,
+        );
+        assert!(info.description.is_none());
+    }
+
+    #[test]
+    fn test_route_info_description_serialized_when_present() {
+        let info = RouteInfo::new(
+            "GET",
+            "/users",
+            "list_users",
+            None,
+            None,
+            None::<String>,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some("All users"),
+        );
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"description\":\"All users\""));
+    }
+
+    #[test]
+    fn test_route_info_description_omitted_when_none() {
+        let info = RouteInfo::new(
+            "GET",
+            "/users",
+            "list_users",
+            None,
+            None,
+            None::<String>,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None::<String>,
+        );
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("\"description\""));
     }
 }

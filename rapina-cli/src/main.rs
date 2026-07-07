@@ -8,6 +8,8 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use terminal_size::{terminal_size, Width};
 
+use crate::commands::{FieldInfo, templates::DatabaseType};
+
 #[derive(Parser)]
 #[command(name = "rapina")]
 #[command(author, version, about = "CLI tool for the Rapina web framework", long_about = None)]
@@ -24,12 +26,25 @@ enum Commands {
     New {
         /// Name of the project to create
         name: String,
-        /// Starter template (crud, auth). Defaults to a REST API scaffold when omitted.
-        #[arg(long)]
+        /// Starter template (rest-api, crud, auth). Defaults to a REST API scaffold when omitted.
+        /// Requires `--db` when using `crud` template.
+        #[arg(long, value_parser = ["rest-api", "crud", "auth"], requires_if("crud", "db"))]
         template: Option<String>,
-        /// Skip generating AI assistant config files (AGENT.md, .claude/, .cursor/)
+        /// Database type (sqlite, postgres, mysql). Required when using `--template crud`.
+        #[arg(long, value_name = "DB")]
+        db: Option<DatabaseType>,
+        /// Skip all AI assistant config files (AGENTS.md, CLAUDE.md, .cursor/, .rapina-docs/)
         #[arg(long)]
         no_ai: bool,
+        /// Skip AGENTS.md and CLAUDE.md generation
+        #[arg(long, conflicts_with_all = ["no_ai", "agents_md_only"])]
+        no_agents_md: bool,
+        /// Skip .rapina-docs/ bundled documentation
+        #[arg(long, conflicts_with_all = ["no_ai"])]
+        no_bundled_docs: bool,
+        /// Generate AGENTS.md and CLAUDE.md only, skip .rapina-docs/
+        #[arg(long, conflicts_with_all = ["no_ai", "no_agents_md"])]
+        agents_md_only: bool,
     },
     /// Add a resource to an existing Rapina project
     Add {
@@ -47,6 +62,11 @@ enum Commands {
         /// Disable hot reload
         #[arg(long)]
         no_reload: bool,
+    },
+    /// llms.txt tools
+    Llms {
+        #[command(subcommand)]
+        command: LlmsCommands,
     },
     /// OpenAPI specification tools
     Openapi {
@@ -85,6 +105,12 @@ enum Commands {
         /// Host to bind to
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        /// Refresh AGENTS.md from current bundled fragments
+        #[arg(long)]
+        fix_agents: bool,
+        /// Force overwrite even if AGENTS.md has user edits inside the markers
+        #[arg(long)]
+        force: bool,
     },
     /// Import from external sources (OpenAPI specs, databases, etc.)
     Import {
@@ -142,7 +168,10 @@ enum AddCommands {
         /// Name of the resource in snake_case (e.g., post, blog_post)
         name: String,
         /// Fields in name:type format (e.g., title:string body:text published:bool)
-        fields: Vec<String>,
+        fields: Vec<FieldInfo>,
+        /// Skip injecting created_at/updated_at timestamp columns
+        #[arg(long)]
+        no_timestamps: bool,
     },
 }
 
@@ -153,6 +182,22 @@ enum MigrateCommands {
         /// Name of the migration (e.g., create_users)
         name: String,
     },
+    /// Set up the migrate binary for this project (creates src/bin/rapina_migrate.rs)
+    Init,
+    /// Apply all pending migrations
+    Up,
+    /// Roll back migrations (default: 1 step)
+    Down {
+        /// Number of migrations to roll back
+        #[arg(long, default_value = "1")]
+        steps: u32,
+    },
+    /// Show applied and pending migrations
+    Status,
+    /// Drop all tables and re-run all migrations (destructive)
+    Fresh,
+    /// Roll back all migrations then re-apply them
+    Reset,
 }
 
 #[derive(Subcommand)]
@@ -183,6 +228,9 @@ enum ImportCommands {
         /// Overwrite existing files (useful for re-importing after schema changes)
         #[arg(long)]
         force: bool,
+        /// Compare entities against the live database and report drift (writes nothing)
+        #[arg(long)]
+        diff: bool,
     },
     /// Import handlers, DTOs, and module structure from an OpenAPI 3.0 spec
     #[cfg(feature = "import-openapi")]
@@ -195,6 +243,22 @@ enum ImportCommands {
         /// Only import endpoints with these tags (comma-separated)
         #[arg(long, value_delimiter = ',')]
         tags: Option<Vec<String>>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LlmsCommands {
+    /// Export llms.txt to stdout or file
+    Export {
+        /// Output file path (stdout if not specified)
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Port to connect to
+        #[arg(short, long, env = "RAPINA_PORT", default_value = "3000")]
+        port: u16,
+        /// Host to connect to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
     },
 }
 
@@ -256,16 +320,30 @@ fn main() {
         Some(Commands::New {
             name,
             template,
+            db,
             no_ai,
+            no_agents_md,
+            no_bundled_docs,
+            agents_md_only,
         }) => {
-            if let Err(e) = commands::new::execute(&name, template.as_deref(), no_ai) {
+            let opts = commands::new::AiOptions {
+                no_ai,
+                no_agents_md,
+                no_bundled_docs,
+                agents_md_only,
+            };
+            if let Err(e) = commands::new::execute(&name, template.as_deref(), db.as_ref(), opts) {
                 eprintln!("{} {}", "Error:".red().bold(), e);
                 std::process::exit(1);
             }
         }
         Some(Commands::Add { command }) => {
             let result = match command {
-                AddCommands::Resource { name, fields } => commands::add::resource(&name, &fields),
+                AddCommands::Resource {
+                    name,
+                    fields,
+                    no_timestamps,
+                } => commands::add::resource(name, fields, !no_timestamps),
             };
             if let Err(e) = result {
                 eprintln!("{} {}", "Error:".red().bold(), e);
@@ -319,6 +397,29 @@ fn main() {
         Some(Commands::Migrate { command }) => {
             let result = match command {
                 MigrateCommands::New { name } => commands::migrate::new_migration(&name),
+                MigrateCommands::Init => std::env::current_dir()
+                    .map_err(|e| format!("Failed to get current directory: {e}"))
+                    .and_then(|cwd| commands::migrate::find_project_root(&cwd))
+                    .and_then(|root| commands::migrate::init_migrate_bin(&root)),
+                MigrateCommands::Up => commands::migrate::run_migrate_cmd(&["up"]),
+                MigrateCommands::Down { steps } => {
+                    let steps_str = steps.to_string();
+                    commands::migrate::run_migrate_cmd(&["down", "--steps", &steps_str])
+                }
+                MigrateCommands::Status => commands::migrate::run_migrate_cmd(&["status"]),
+                MigrateCommands::Fresh => commands::migrate::run_migrate_cmd(&["fresh"]),
+                MigrateCommands::Reset => commands::migrate::run_migrate_cmd(&["reset"]),
+            };
+            if let Err(e) = result {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Llms { command }) => {
+            let result = match command {
+                LlmsCommands::Export { output, host, port } => {
+                    commands::llms::export(output, &host, port)
+                }
             };
             if let Err(e) = result {
                 eprintln!("{} {}", "Error:".red().bold(), e);
@@ -389,19 +490,36 @@ fn main() {
                     tables,
                     schema,
                     force,
+                    diff,
                 } => {
                     #[cfg(feature = "import")]
                     {
-                        commands::import::database(
-                            &url,
-                            tables.as_deref(),
-                            schema.as_deref(),
-                            force,
-                        )
+                        if diff && force {
+                            Err("--diff does not write files; remove --force".to_string())
+                        } else if diff {
+                            match commands::import::diff::database_diff(
+                                &url,
+                                tables.as_deref(),
+                                schema.as_deref(),
+                            ) {
+                                Ok(report) => {
+                                    commands::import::diff::render(&report);
+                                    std::process::exit(report.exit_code());
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            commands::import::database(
+                                &url,
+                                tables.as_deref(),
+                                schema.as_deref(),
+                                force,
+                            )
+                        }
                     }
                     #[cfg(not(feature = "import"))]
                     {
-                        let _ = (url, tables, schema, force);
+                        let _ = (url, tables, schema, force, diff);
                         Err("The import command requires the import feature. \
                              Reinstall with: cargo install rapina-cli --features import-postgres"
                             .to_string())
@@ -423,8 +541,18 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Doctor { host, port }) => {
-            let config = commands::doctor::DoctorConfig { host, port };
+        Some(Commands::Doctor {
+            host,
+            port,
+            fix_agents,
+            force,
+        }) => {
+            let config = commands::doctor::DoctorConfig {
+                host,
+                port,
+                fix_agents,
+                force,
+            };
             if let Err(e) = commands::doctor::execute(config) {
                 eprintln!("{} {}", "Error:".red().bold(), e);
                 std::process::exit(1);

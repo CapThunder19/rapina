@@ -1,12 +1,12 @@
 //! The main application builder for Rapina.
 
-use std::future::Future;
-use std::net::SocketAddr;
-use std::time::Duration;
-
 use crate::auth::{AuthConfig, AuthMiddleware, PublicRoutes};
+#[cfg(feature = "cron-scheduler")]
+use crate::cron_scheduler::CronScheduler;
 use crate::health::{HealthRegistry, health_check, liveness_check, readiness_check};
-use crate::introspection::{RouteRegistry, list_routes};
+use crate::introspection::{
+    LlmsRegistry, RouteRegistry, list_routes, llms_txt_handler, to_llms_txt,
+};
 #[cfg(feature = "metrics")]
 use crate::metrics::{MetricsMiddleware, MetricsRegistry, metrics_handler};
 #[cfg(feature = "compression")]
@@ -18,9 +18,14 @@ use crate::middleware::{
 use crate::middleware::{RateLimitConfig, RateLimitMiddleware};
 use crate::observability::TracingConfig;
 use crate::openapi::{OpenApiRegistry, build_openapi_spec, openapi_spec};
+#[cfg(feature = "jwks")]
+use crate::prelude::JwksClient;
 use crate::router::Router;
 use crate::server::{ShutdownHook, serve};
 use crate::state::AppState;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::time::Duration;
 
 /// The main application type for building Rapina servers.
 ///
@@ -62,7 +67,13 @@ pub struct Rapina {
     /// Custom health checks
     pub(crate) health_registry: HealthRegistry,
     /// Whether metrics is enabled.
+    #[cfg(feature = "metrics")]
     pub(crate) metrics: bool,
+    /// Whether llms.txt endpoint is enabled
+    pub(crate) llms_txt: bool,
+    /// Custom Prometheus collectors to include in the metrics endpoint.
+    #[cfg(feature = "metrics")]
+    pub(crate) custom_metrics: Vec<Box<dyn prometheus::core::Collector>>,
     /// Whether OpenAPI is enabled
     pub(crate) openapi: bool,
     pub(crate) openapi_title: String,
@@ -87,7 +98,20 @@ pub struct Rapina {
     /// Background job worker configuration. `None` means the worker is disabled.
     #[cfg(feature = "database")]
     pub(crate) jobs_config: Option<crate::jobs::JobConfig>,
+    #[cfg(feature = "cron-scheduler")]
+    pub(crate) cron_scheduler: Option<CronScheduler>,
+    /// Tracing/logging configuration, applied when the server starts.
+    pub(crate) tracing_config: Option<TracingConfig>,
+    /// OTLP telemetry export configuration (if enabled)
+    #[cfg(feature = "otel")]
+    pub(crate) telemetry_config: Option<crate::observability::TelemetryConfig>,
 }
+
+/// Tracks whether the process-global telemetry pipeline has been installed, so a
+/// second `listen` does not build a second exporter or silently fail to install.
+#[cfg(feature = "otel")]
+static TELEMETRY_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // Resolves the listen address, preferring RAPINA_HOST/RAPINA_PORT over addr when both are set.
 pub(crate) fn resolve_listen_addr(addr: &str) -> SocketAddr {
@@ -111,7 +135,11 @@ impl Rapina {
             introspection: cfg!(debug_assertions),
             health_check: false,
             health_registry: HealthRegistry::new(),
+            #[cfg(feature = "metrics")]
             metrics: false,
+            llms_txt: cfg!(debug_assertions),
+            #[cfg(feature = "metrics")]
+            custom_metrics: Vec::new(),
             openapi: false,
             openapi_title: "API".to_string(),
             openapi_version: "1.0.0".to_string(),
@@ -126,6 +154,11 @@ impl Rapina {
             rfc7807_base_uri: "about:blank".to_string(),
             #[cfg(feature = "database")]
             jobs_config: None,
+            #[cfg(feature = "cron-scheduler")]
+            cron_scheduler: None,
+            tracing_config: None,
+            #[cfg(feature = "otel")]
+            telemetry_config: None,
         }
     }
 
@@ -177,10 +210,77 @@ impl Rapina {
         self
     }
 
+    /// Adds a pre-existing `Arc<T>` as shared state.
+    ///
+    /// This is the preferred way to register trait objects for dependency
+    /// injection.  Without this method, passing an `Arc<dyn MyTrait>` to
+    /// [`.state()`](Self::state) requires a newtype wrapper; with `state_arc`
+    /// you can register the arc directly.
+    ///
+    /// With `state_arc` the `Arc` is registered under its own [`TypeId`], so
+    /// no newtype wrapper is required.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use rapina::prelude::*;
+    /// use std::sync::Arc;
+    ///
+    /// trait MyRepo: Send + Sync {
+    ///     fn find_all(&self) -> Vec<String>;
+    /// }
+    ///
+    /// struct PgRepo;
+    /// impl MyRepo for PgRepo {
+    ///     fn find_all(&self) -> Vec<String> { vec![] }
+    /// }
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> std::io::Result<()> {
+    ///     Rapina::new()
+    ///         .state_arc(Arc::new(PgRepo) as Arc<dyn MyRepo>)
+    ///         .listen("127.0.0.1:3000")
+    ///         .await
+    /// }
+    /// ```
+    pub fn state_arc<T: ?Sized + Send + Sync + 'static>(
+        mut self,
+        value: std::sync::Arc<T>,
+    ) -> Self {
+        self.state = self.state.with_arc(value);
+        self
+    }
+
     /// Adds a middleware to the application.
     pub fn middleware<M: Middleware>(mut self, middleware: M) -> Self {
         self.middlewares.add(middleware);
         self
+    }
+
+    /// Adds a tower layer as middleware.
+    ///
+    /// This is a convenience method equivalent to
+    /// `.middleware(TowerLayerMiddleware::new(layer))`.
+    ///
+    /// Requires the `tower` feature.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use rapina::prelude::*;
+    ///
+    /// Rapina::new()
+    ///     .layer(my_tower_layer)
+    ///     .listen("127.0.0.1:3000")
+    ///     .await
+    /// ```
+    #[cfg(feature = "tower")]
+    pub fn layer<L>(self, layer: L) -> Self
+    where
+        L: tower_layer::Layer<crate::middleware::NextService>,
+        crate::middleware::TowerLayerMiddleware<L>: Middleware,
+    {
+        self.middleware(crate::middleware::TowerLayerMiddleware::new(layer))
     }
 
     /// Enables CORS for the application.
@@ -345,22 +445,84 @@ impl Rapina {
     }
 
     /// Configures tracing/logging for the application.
-    pub fn with_tracing(self, config: TracingConfig) -> Self {
-        config.init();
+    ///
+    /// The subscriber is installed when the server starts (in [`listen`]), so it
+    /// can be composed with the OTLP export layer from [`with_telemetry`] onto a
+    /// single global subscriber.
+    ///
+    /// [`listen`]: Self::listen
+    /// [`with_telemetry`]: Self::with_telemetry
+    pub fn with_tracing(mut self, config: TracingConfig) -> Self {
+        self.tracing_config = Some(config);
+        self
+    }
+
+    /// Configures OTLP trace export to a collector such as Jaeger or Datadog.
+    ///
+    /// Traces are exported over OTLP gRPC and incoming W3C `traceparent` headers
+    /// are honored so traces continue across service boundaries. The exporter is
+    /// built and the subscriber installed when the server starts (in [`listen`]).
+    ///
+    /// [`listen`]: Self::listen
+    #[cfg(feature = "otel")]
+    pub fn with_telemetry(mut self, config: crate::observability::TelemetryConfig) -> Self {
+        self.telemetry_config = Some(config);
         self
     }
 
     /// Enables or disables the introspection endpoint.
     ///
-    /// When enabled, a `GET /.__rapina/routes` endpoint is registered
+    /// When enabled, a `GET /__rapina/routes` endpoint is registered
     /// that returns all routes as JSON.
     ///
     /// Introspection is enabled by default in debug builds.
+    /// Use this when the value is dynamic (e.g. read from config/env).
+    /// For literal call sites, prefer [`enable_introspection`](Self::enable_introspection)
+    /// or [`disable_introspection`](Self::disable_introspection).
     pub fn with_introspection(mut self, enabled: bool) -> Self {
         self.introspection = enabled;
         self
     }
 
+    /// Enables the introspection endpoint.
+    ///
+    /// Convenience wrapper for `.with_introspection(true)`.
+    pub fn enable_introspection(self) -> Self {
+        self.with_introspection(true)
+    }
+
+    /// Disables the introspection endpoint.
+    ///
+    /// Convenience wrapper for `.with_introspection(false)`.
+    /// Useful in tests or production builds where introspection should be
+    /// suppressed even when debug assertions are active.
+    pub fn disable_introspection(self) -> Self {
+        self.with_introspection(false)
+    }
+
+    /// Enables or disables the `/__rapina/llms.txt` endpoint.
+    ///
+    /// When enabled, a Markdown document following the llms.txt convention is
+    /// generated once at startup from the registered routes and served at
+    /// `GET /__rapina/llms.txt` as `text/plain; charset=utf-8`.
+    ///
+    /// Defaults to `true` in debug builds, `false` in release builds.
+    pub fn with_llms_txt(mut self, enabled: bool) -> Self {
+        self.llms_txt = enabled;
+        self
+    }
+
+    /// Enables the `/__rapina/llms.txt` endpoint.
+    pub fn enable_llms_txt(self) -> Self {
+        self.with_llms_txt(true)
+    }
+
+    /// Disables the `/__rapina/llms.txt` endpoint.
+    pub fn disable_llms_txt(self) -> Self {
+        self.with_llms_txt(false)
+    }
+
+    /// Health check is disabled by default.
     /// Enables or disables the built-in health check endpoints.
     ///
     /// When enabled, registers readiness and liveness health check endpoints:
@@ -368,18 +530,125 @@ impl Rapina {
     /// - `GET /__rapina/health/live` — liveness probe, always returns `200 OK`
     /// - `GET /__rapina/health/ready` — readiness probe, runs DB and custom checks
     ///
-    /// Health check is disabled by default.
+    /// Prefer this when the value is dynamic (e.g. read from config/env):
+    ///
+    /// ```ignore
+    /// let cfg = Config::from_env();
+    /// Rapina::new().with_health_check(cfg.health_check_enabled);
+    /// ```
+    ///
+    /// For fixed call sites, [`enable_health_check`](Self::enable_health_check) reads more clearly:
+    ///
+    /// ```rust,no_run
+    /// # use rapina::prelude::*;
+    /// Rapina::new().enable_health_check();
+    /// ```
     pub fn with_health_check(mut self, enabled: bool) -> Self {
         self.health_check = enabled;
         self
     }
 
+    /// Enables the built-in health check endpoints.
+    ///
+    /// Convenience wrapper for `.with_health_check(true)`. See
+    /// [`with_health_check`](Self::with_health_check) for the dynamic-config form.
+    pub fn enable_health_check(self) -> Self {
+        self.with_health_check(true)
+    }
+
+    /// Disables the built-in health check endpoints.
+    ///
+    /// Convenience wrapper for `.with_health_check(false)`. See
+    /// [`with_health_check`](Self::with_health_check) for the dynamic-config form.
+    pub fn disable_health_check(self) -> Self {
+        self.with_health_check(false)
+    }
+
+    /// Registers a new scheduled cronjob.
+    /// The `CronScheduler` instance will be started during Rapina's webserver startup phase.
+    #[cfg(feature = "cron-scheduler")]
+    pub fn cron<F, Fut, E>(mut self, cron_schedule: &str, task: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: std::error::Error + Send + 'static,
+    {
+        // Lazily initialize the scheduler if it's still None and get a mutable reference
+        let cron_scheduler = self.cron_scheduler.get_or_insert_with(CronScheduler::new);
+        cron_scheduler
+            .schedule(cron_schedule.to_string(), task)
+            .expect("Failed to schedule cron job");
+
+        self
+    }
+
+    /// Starts the Cronjob Scheduler and registers the shutdown hook
+    #[cfg(feature = "cron-scheduler")]
+    async fn start_cronjob_scheduler(mut self) -> Self {
+        if let Some(mut cron_scheduler) = self.cron_scheduler.take() {
+            cron_scheduler.start().await;
+            self = self.on_shutdown(move || async move {
+                cron_scheduler.shutdown().await;
+            });
+        }
+        self
+    }
+
+    /// Warms up the JWKS cache immediately without waiting for the next cronjob tick
+    #[cfg(feature = "jwks")]
+    async fn warmup_jwks_cache(&self) -> () {
+        let Some(jwks_client) = self.state.get::<JwksClient>().cloned() else {
+            tracing::error!(
+                "Skipped warmup of JWKS cache because the Rapina state for JwksClient is empty. Did you forget to call .state(jwks_client)?"
+            );
+
+            return;
+        };
+
+        match jwks_client.refresh_jwks_cache().await {
+            Ok(_) => tracing::info!("Successfully warmed up JWKS cache"),
+            Err(e) => tracing::error!("Failed warmup of JWKS cache: {}", e),
+        }
+    }
+
+    /// Schedules the JWKS refresh cronjob
+    #[cfg(feature = "jwks")]
+    fn schedule_jwks_cronjob(mut self) -> Self {
+        let Some(jwks_client) = self.state.get::<JwksClient>().cloned() else {
+            tracing::error!(
+                "Skipped scheduling the JWKS refresh cronjob because the Rapina state for JwksClient is empty. Did you forget to call .state(jwks_client)?"
+            );
+            return self;
+        };
+
+        let refresh_schedule = jwks_client.refresh_schedule().to_owned();
+        let jwks_client = jwks_client.clone();
+
+        self = self.cron(&refresh_schedule, move || {
+            let jwks_client = jwks_client.clone();
+            async move { jwks_client.refresh_jwks_cache().await }
+        });
+
+        tracing::info!(
+            "Scheduled JWKS refresh cronjob with schedule '{}'",
+            refresh_schedule
+        );
+        self
+    }
+
+    /// The function is called on every `GET /__rapina/health` request.
     /// Registers a custom health check function.
     ///
-    /// The function is called on every `GET /__rapina/health` request.
-    /// Return `true` if healthy, `false` if not.
+    /// Registers a named async health check function.
     ///
-    /// Requires `.with_health_check(true)` to be set.
+    /// The function is called on every `GET /__rapina/health/ready` request.
+    /// Return `true` if the dependency is healthy, `false` otherwise.
+    ///
+    /// Note: this registers a check function — it does **not** enable the health
+    /// endpoints. You still need to call `.enable_health_check()` (or
+    /// `.with_health_check(true)` for dynamic config) to activate the endpoints.
+    /// A warning is emitted at startup if checks are registered but the endpoint
+    /// is disabled.
     pub fn add_health_check<F, Fut>(mut self, name: &'static str, f: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -455,14 +724,71 @@ impl Rapina {
         self
     }
 
+    /// Metrics is disabled by default unless you call `with_metrics(true)`.
     /// Enables or disables the metrics endpoint.
     ///
     /// When enabled, a `GET /metrics` endpoint is registered
     /// that returns all metrics to Prometheus.
     ///
-    /// Metrics is disabled by default unless you call `with_metrics(true)`.
+    /// Use this when the value is dynamic (e.g. read from config/env).
+    /// For literal call sites, prefer [`enable_metrics`](Self::enable_metrics)
+    /// or [`disable_metrics`](Self::disable_metrics).
+    #[cfg(feature = "metrics")]
     pub fn with_metrics(mut self, enabled: bool) -> Self {
         self.metrics = enabled;
+        self
+    }
+
+    /// Enables the metrics endpoint.
+    ///
+    /// Convenience wrapper for `.with_metrics(true)`.
+    #[cfg(feature = "metrics")]
+    pub fn enable_metrics(self) -> Self {
+        self.with_metrics(true)
+    }
+
+    /// Disables the metrics endpoint.
+    ///
+    /// Convenience wrapper for `.with_metrics(false)`.
+    #[cfg(feature = "metrics")]
+    pub fn disable_metrics(self) -> Self {
+        self.with_metrics(false)
+    }
+
+    /// Registers a custom Prometheus collector to be included in the `/metrics` endpoint.
+    ///
+    /// Use this to mix your own application metrics — counters, gauges, histograms — into
+    /// the same endpoint that Rapina uses for its built-in HTTP metrics.
+    ///
+    /// Requires the `metrics` feature and `.enable_metrics()` (or `.with_metrics(true)`)
+    /// to be called as well.
+    ///
+    /// # Panics
+    ///
+    /// Panics at startup if the collector's metric name collides with a built-in Rapina metric
+    /// (`http_requests_total`, `http_request_duration_seconds`, `http_requests_in_flight`) or with
+    /// another previously registered custom collector. Choose unique metric names to avoid this.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use rapina::prelude::*;
+    /// use prometheus::{IntCounterVec, Opts};
+    ///
+    /// let orders_total = IntCounterVec::new(
+    ///     Opts::new("orders_total", "Total number of orders placed"),
+    ///     &["status"],
+    /// )
+    /// .unwrap();
+    ///
+    /// Rapina::new()
+    ///     .enable_metrics()
+    ///     .add_metric(orders_total.clone())
+    ///     .listen("127.0.0.1:3000");
+    /// ```
+    #[cfg(feature = "metrics")]
+    pub fn add_metric(mut self, collector: impl prometheus::core::Collector + 'static) -> Self {
+        self.custom_metrics.push(Box::new(collector));
         self
     }
 
@@ -538,17 +864,20 @@ impl Rapina {
         mut self,
         config: crate::database::DatabaseConfig,
     ) -> Result<Self, std::io::Error> {
+        let policy = crate::database::DatabaseMigrationPolicy {
+            auto_apply: config.auto_migrate,
+        };
         let conn = config
             .connect()
             .await
             .map_err(|e| std::io::Error::other(format!("Database connection failed: {}", e)))?;
-        self.state = self.state.with(conn);
+        self.state = self.state.with(conn).with(policy);
         Ok(self)
     }
 
-    /// Runs all pending database migrations at startup.
+    /// Runs database migrations according to [`DatabaseConfig::auto_migrate`](crate::database::DatabaseConfig::auto_migrate), or only warns about pending migrations when it is `false`.
     ///
-    /// Call this after `with_database()` to apply migrations before serving requests.
+    /// Call this after `with_database()` so the policy from configuration is available. If only a raw [`DatabaseConnection`] was registered (for example via [`Rapina::state`](crate::app::Rapina::state)), pending migrations are **not** applied and a warning is logged if any are pending (same as `auto_migrate: false`).
     ///
     /// # Example
     ///
@@ -556,7 +885,9 @@ impl Rapina {
     /// mod migrations;
     ///
     /// Rapina::new()
-    ///     .with_database(DatabaseConfig::from_env()?).await?
+    ///     .with_database(
+    ///         DatabaseConfig::new("sqlite://app.db?mode=rwc").auto_migrate(true),
+    ///     ).await?
     ///     .run_migrations::<migrations::Migrator>().await?
     ///     .router(router)
     ///     .listen("127.0.0.1:3000")
@@ -571,12 +902,17 @@ impl Rapina {
             .get::<sea_orm::DatabaseConnection>()
             .ok_or_else(|| {
                 std::io::Error::other(
-                    "Database not configured. Call .with_database() before
-  .run_migrations()",
+                    "Database connection not found in application state. Register it with .with_database() or .state(DatabaseConnection).",
                 )
             })?;
 
-        crate::migration::run_pending::<M>(conn)
+        let auto_apply = self
+            .state
+            .get::<crate::database::DatabaseMigrationPolicy>()
+            .map(|p| p.auto_apply)
+            .unwrap_or(false);
+
+        crate::migration::run_startup_migrations::<M>(conn, auto_apply)
             .await
             .map_err(|e| std::io::Error::other(format!("Migration failed: {}", e)))?;
 
@@ -592,6 +928,14 @@ impl Rapina {
             use_rfc7807: self.rfc7807_errors,
             base_uri: self.rfc7807_base_uri.clone(),
         });
+
+        // Trace context propagation runs first so the request span carries the
+        // parent extracted from incoming headers and wraps every other layer.
+        #[cfg(feature = "otel")]
+        if self.telemetry_config.is_some() {
+            self.middlewares
+                .prepend(crate::middleware::TraceContextMiddleware::new());
+        }
 
         // Auto-discover routes from inventory (must run before auth middleware)
         if self.auto_discover {
@@ -663,6 +1007,25 @@ impl Rapina {
                 .get_named("/__rapina/routes", "list_routes", list_routes);
         }
 
+        if self.llms_txt {
+            // Snapshot routes BEFORE registering /__rapina/llms.txt so the document
+            // doesn't reference itself. The /__rapina/* filter in to_llms_txt is
+            // defense-in-depth.
+            let routes = self.router.routes();
+            let content = to_llms_txt(&self.openapi_title, &routes);
+            self.state = self.state.with(LlmsRegistry::new(content));
+            self.router = self
+                .router
+                .get_named("/__rapina/llms.txt", "llms_txt", llms_txt_handler);
+        }
+
+        if !self.health_check && !self.health_registry.checks.is_empty() {
+            tracing::warn!(
+                "add_health_check() was called but the health check endpoint is disabled. \
+                Call .enable_health_check() or .with_health_check(true) to activate it."
+            );
+        }
+
         if self.health_check {
             let registry = std::mem::take(&mut self.health_registry);
             self.state = self.state.with(registry);
@@ -675,7 +1038,8 @@ impl Rapina {
 
         #[cfg(feature = "metrics")]
         if self.metrics {
-            let registry = MetricsRegistry::new();
+            let registry =
+                MetricsRegistry::new_with_collectors(std::mem::take(&mut self.custom_metrics));
             self.state = self.state.with(registry.clone());
             self.middlewares.add(MetricsMiddleware::new(registry));
             self.router = self
@@ -713,7 +1077,62 @@ impl Rapina {
     /// in dev mode and the banner is correct by construction.
     pub async fn listen(self, addr: &str) -> std::io::Result<()> {
         let addr: SocketAddr = resolve_listen_addr(addr);
+
+        // Install the tracing subscriber before anything else so startup logs are
+        // captured. When telemetry is configured the OTLP export layer is composed
+        // onto the same subscriber, since a global subscriber can only be set once.
+        // The global state (subscriber, tracer provider, propagator) is installed
+        // at most once per process; a second `listen` reuses it.
+        let tracing_config = self.tracing_config.clone();
+        #[cfg(feature = "otel")]
+        let otel_provider = match self.telemetry_config.clone() {
+            Some(config)
+                if !TELEMETRY_INITIALIZED.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+            {
+                let (provider, layer) = crate::observability::build_otel_pipeline(&config)
+                    .map_err(std::io::Error::other)?;
+                opentelemetry::global::set_tracer_provider(provider.clone());
+                opentelemetry::global::set_text_map_propagator(
+                    opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+                );
+                if crate::observability::init_subscriber(tracing_config, Some(layer)).is_err() {
+                    eprintln!(
+                        "rapina: telemetry is enabled but a tracing subscriber is already installed; \
+                         OTLP traces will not be exported"
+                    );
+                }
+                Some(provider)
+            }
+            Some(_) => {
+                eprintln!("rapina: telemetry already initialized; ignoring repeated configuration");
+                None
+            }
+            None => {
+                let _ = crate::observability::init_subscriber(tracing_config, None);
+                None
+            }
+        };
+        #[cfg(not(feature = "otel"))]
+        let _ = crate::observability::init_subscriber(tracing_config, None);
+
         let app = self.prepare();
+
+        // Flush exported spans during graceful shutdown so in-flight traces are
+        // not dropped. The hook runs after connections drain.
+        #[cfg(feature = "otel")]
+        let app = {
+            let mut app = app;
+            if let Some(provider) = otel_provider {
+                app.shutdown_hooks.push(Box::new(move || {
+                    Box::pin(async move {
+                        // shutdown joins the exporter's background thread, so run it
+                        // off the async runtime worker.
+                        let _ = tokio::task::spawn_blocking(move || provider.shutdown()).await;
+                    })
+                }));
+            }
+            app
+        };
 
         // Spawn the background job worker if configured.  The worker receives
         // a cheap clone of AppState (inner values are Arc-wrapped) so it shares
@@ -724,6 +1143,17 @@ impl Rapina {
             let worker = crate::jobs::worker::Worker::new(state, config);
             tokio::spawn(worker.run());
         }
+
+        #[cfg(feature = "jwks")]
+        // Warms up the JWKS cache so it is available immediately when the webserver starts up
+        // and registers the JWKS refresh cronjob
+        let app = {
+            app.warmup_jwks_cache().await;
+            app.schedule_jwks_cronjob()
+        };
+
+        #[cfg(feature = "cron-scheduler")]
+        let app = app.start_cronjob_scheduler().await;
 
         serve(
             app.router,
@@ -747,6 +1177,8 @@ impl Default for Rapina {
 mod tests {
     use super::*;
     use crate::middleware::TimeoutMiddleware;
+    #[cfg(feature = "cron-scheduler")]
+    use crate::prelude::Error;
     use http::StatusCode;
     use std::time::Duration;
 
@@ -955,15 +1387,109 @@ mod tests {
     }
 
     #[test]
+    fn test_rapina_with_health_check_enabled() {
+        let app = Rapina::new().with_health_check(true);
+        assert!(app.health_check);
+    }
+
+    #[test]
+    fn test_rapina_with_health_check_disabled() {
+        let app = Rapina::new().with_health_check(false);
+        assert!(!app.health_check);
+    }
+
+    #[test]
+    #[cfg(feature = "metrics")]
     fn test_rapina_with_metrics_enabled() {
         let app = Rapina::new().with_metrics(true);
         assert!(app.metrics);
     }
 
     #[test]
+    #[cfg(feature = "metrics")]
     fn test_rapina_with_metrics_disabled() {
         let app = Rapina::new().with_metrics(false);
         assert!(!app.metrics);
+    }
+
+    #[test]
+    #[cfg(feature = "metrics")]
+    fn test_rapina_add_metric_stores_collector() {
+        use prometheus::IntCounter;
+
+        let counter = IntCounter::new("my_app_total", "My app counter").unwrap();
+        let app = Rapina::new().enable_metrics().add_metric(counter);
+
+        assert_eq!(app.custom_metrics.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "metrics")]
+    fn test_rapina_add_multiple_metrics() {
+        use prometheus::{IntCounter, IntGauge};
+
+        let c1 = IntCounter::new("metric_one", "first").unwrap();
+        let c2 = IntCounter::new("metric_two", "second").unwrap();
+        let g1 = IntGauge::new("metric_three", "third").unwrap();
+
+        let app = Rapina::new()
+            .enable_metrics()
+            .add_metric(c1)
+            .add_metric(c2)
+            .add_metric(g1);
+
+        assert_eq!(app.custom_metrics.len(), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "metrics")]
+    fn test_rapina_custom_metrics_appear_in_output() {
+        use crate::metrics::MetricsRegistry;
+        use prometheus::IntCounter;
+
+        let counter = IntCounter::new("orders_placed_total", "Orders placed").unwrap();
+        counter.inc();
+        counter.inc();
+
+        let registry = MetricsRegistry::new_with_collectors(vec![Box::new(counter)]);
+        let output = registry.encode();
+
+        assert!(output.contains("orders_placed_total"));
+        assert!(output.contains("Orders placed"));
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to register custom metric")]
+    #[cfg(feature = "metrics")]
+    fn test_add_metric_collision_with_builtin_panics() {
+        use prometheus::IntCounter;
+
+        // "http_requests_in_flight" is registered by Rapina internally;
+        // a custom collector with the same name must panic during prepare().
+        let collider =
+            IntCounter::new("http_requests_in_flight", "collides with built-in").unwrap();
+
+        Rapina::new()
+            .enable_metrics()
+            .add_metric(collider)
+            .prepare();
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to register custom metric")]
+    #[cfg(feature = "metrics")]
+    fn test_add_metric_duplicate_custom_names_panics() {
+        use prometheus::IntCounter;
+
+        // Two user-supplied collectors sharing the same name must panic during prepare().
+        let c1 = IntCounter::new("my_custom_events_total", "first").unwrap();
+        let c2 = IntCounter::new("my_custom_events_total", "second").unwrap();
+
+        Rapina::new()
+            .enable_metrics()
+            .add_metric(c1)
+            .add_metric(c2)
+            .prepare();
     }
 
     #[test]
@@ -1053,5 +1579,38 @@ mod tests {
             assert!(app.state.get::<MyState>().is_some());
             assert_eq!(app.shutdown_timeout, Duration::from_secs(10));
         }
+    }
+
+    #[cfg(feature = "cron-scheduler")]
+    #[test]
+    fn test_rapina_cron_adds_cronjob() {
+        let app = Rapina::new().cron("1/5 * * * * *", || async {
+            println!("cronjob 1");
+            Ok::<(), Error>(())
+        });
+        assert_eq!(app.cron_scheduler.unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "cron-scheduler")]
+    #[test]
+    fn test_rapina_cron_adds_multiple_cronjobs() {
+        let app = Rapina::new()
+            .cron("1/5 * * * * *", || async {
+                println!("cronjob 1");
+                Ok::<(), Error>(())
+            })
+            .cron("1/5 * * * * *", || async {
+                println!("cronjob 2");
+                Ok::<(), Error>(())
+            });
+        assert_eq!(app.cron_scheduler.unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "cron-scheduler")]
+    #[test]
+    #[should_panic]
+    fn test_rapina_cron_broken_cronjob_panics() {
+        let broken_schedule = "";
+        Rapina::new().cron(broken_schedule, || async { Ok::<(), Error>(()) });
     }
 }
