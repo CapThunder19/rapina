@@ -610,6 +610,7 @@ fn print_banner() {
         println!("{}", center_line(line, terminal_width).bright_blue());
     }
 
+    println!();
     println!("{}", center_line("Rapina CLI", terminal_width).bold());
 }
 
