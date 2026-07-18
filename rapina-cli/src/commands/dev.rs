@@ -218,12 +218,18 @@ fn print_banner(config: &DevConfig) {
     let url = format!("http://{}:{}", config.host, config.port);
     let routes_url = format!("{}/__rapina/routes", url);
 
-    // Box is 61 chars wide total, 59 chars inner content
+    // Box is 61 chars wide total, 59 chars inner content, plus 1 leading space = 62
+    const BOX_WIDTH: usize = 62;
     let b = "│".custom_color(colors::mauve());
 
     println!();
     for line in JUCA_BANNER.lines().filter(|l| !l.trim().is_empty()) {
-        println!("{}", line.custom_color(colors::sky()).bold());
+        let padding = BOX_WIDTH.saturating_sub(line.chars().count()) / 2;
+        println!(
+            "{}{}",
+            " ".repeat(padding),
+            line.custom_color(colors::sky()).bold()
+        );
     }
 
     println!();
